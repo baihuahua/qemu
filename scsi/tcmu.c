@@ -221,7 +221,8 @@ static int qemu_tcmu_added(struct tcmu_device *dev)
     exp->tcmu_dev = dev;
     aio_set_fd_handler(blk_get_aio_context(exp->blk),
                        tcmu_get_dev_fd(dev),
-                       true, qemu_tcmu_dev_event_handler, NULL, exp);
+                       true, qemu_tcmu_dev_event_handler,
+                       NULL, NULL, exp);
     return 0;
 }
 
