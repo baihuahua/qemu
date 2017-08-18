@@ -98,7 +98,7 @@ static int qemu_tcmu_handle_cmd(TCMUExport *exp, struct tcmulib_cmd *cmd)
     DPRINTF("handle cmd: 0x%x\n", cdb[0]);
     switch (cdb[0]) {
     case INQUIRY:
-        return tcmu_emulate_inquiry(exp->tcmu_dev, cdb,
+        return tcmu_emulate_inquiry(exp->tcmu_dev, NULL, cdb,
                                     cmd->iovec, cmd->iov_cnt,
                                     cmd->sense_buf);
     case TEST_UNIT_READY:
