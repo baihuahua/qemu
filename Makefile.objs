@@ -11,11 +11,11 @@ chardev-obj-y = chardev/
 
 block-obj-y += nbd/
 block-obj-y += block.o blockjob.o
-block-obj-y += block/
+block-obj-y += block/ scsi/
 block-obj-y += qemu-io-cmds.o
 block-obj-$(CONFIG_REPLICATION) += replication.o
 
-block-obj-m = block/
+block-obj-m = block/ scsi/
 
 #######################################################################
 # crypto-obj-y is code used by both qemu system emulation and qemu-img
