@@ -3355,7 +3355,7 @@ if test "$tcmu" != "no"; then
 
 int main(int argc, char **argv)
 {
-  struct tcmulib_context *ctx = tcmulib_initialize(NULL, 0, NULL);
+  struct tcmulib_context *ctx = tcmulib_initialize(NULL, 0);
   tcmulib_register(ctx);
   return ctx != NULL;
 }

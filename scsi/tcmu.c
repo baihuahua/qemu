@@ -284,14 +284,6 @@ static TCMUExport *qemu_tcmu_parse_cfgstr(const char *cfgstr,
     return exp;
 }
 
-static void qemu_tcmu_errp(const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    error_vprintf(fmt, ap);
-    va_end(ap);
-}
-
 void qemu_tcmu_start(const char *subtype, Error **errp)
 {
     int fd;
@@ -304,8 +296,8 @@ void qemu_tcmu_start(const char *subtype, Error **errp)
     assert(!qemu_tcmu_handler.subtype);
     qemu_tcmu_handler.subtype = g_strdup(subtype);
     handler_state = g_new0(TCMUHandlerState, 1);
-    handler_state->tcmulib_ctx = tcmulib_initialize(&qemu_tcmu_handler, 1,
-                                                    qemu_tcmu_errp);
+    handler_state->tcmulib_ctx = tcmulib_initialize(&qemu_tcmu_handler, 1);
+
     if (!handler_state->tcmulib_ctx) {
         error_setg(errp, "Failed to initialize tcmulib");
         goto fail;
