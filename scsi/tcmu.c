@@ -116,7 +116,7 @@ static int qemu_tcmu_handle_cmd(TCMUExport *exp, struct tcmulib_cmd *cmd)
         }
     case MODE_SENSE:
     case MODE_SENSE_10:
-        return tcmu_emulate_mode_sense(cdb, cmd->iovec,
+        return tcmu_emulate_mode_sense(exp->tcmu_dev, cdb, cmd->iovec,
                                        cmd->iov_cnt, cmd->sense_buf);
     case MODE_SELECT:
     case MODE_SELECT_10:
