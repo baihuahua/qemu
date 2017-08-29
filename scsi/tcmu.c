@@ -30,6 +30,7 @@
 #include "qemu/main-loop.h"
 #include "qmp-commands.h"
 
+#include "qemu/compiler.h"
 #define TCMU_DEBUG 1
 
 #define DPRINTF(...) do { \
@@ -199,7 +200,7 @@ static bool qemu_tcmu_check_config(const char *cfgstr, char **reason)
 {
     Error *local_err = NULL;
 
-    qemu_tcmu_parse_cfgstr(cfgstr, &local_err);
+   // qemu_tcmu_parse_cfgstr(cfgstr, &local_err);
     if (local_err) {
         *reason = strdup(error_get_pretty(local_err));
         error_free(local_err);
@@ -251,10 +252,15 @@ static TCMUExport *qemu_tcmu_parse_cfgstr(const char *cfgstr,
                                           Error **errp)
 {
     BlockBackend *blk;
+    //BlockDriverState *bs;
     const char *dev_str, *device;
     const char *subtype = qemu_tcmu_handler.subtype;
     size_t subtype_len;
     TCMUExport *exp;
+    QDict *options = NULL;
+    int flags = BDRV_O_RDWR;
+    Error *local_err = NULL;
+    //struct tcmu_device *dev = DO_UPCAST(struct tcmu_device, cfgstring, cfgstr);
 
     if (!subtype) {
         error_setg(errp, "TCMU Handler not started");
@@ -273,14 +279,30 @@ static TCMUExport *qemu_tcmu_parse_cfgstr(const char *cfgstr,
     device = &dev_str[1];
 
     blk = blk_by_name(device);
-    if (!blk) {
-        error_setg(errp, "TCMU: Device not found: %s", device);
-        return NULL;
+    if (blk) {
+    	exp = qemu_tcmu_lookup(blk);
+    	if (!exp) {
+        	error_setg(errp, "TCMU: Device not found: %s", device);
+        	return NULL;
+    	}
     }
-    exp = qemu_tcmu_lookup(blk);
-    if (!exp) {
-        error_setg(errp, "TCMU: Device not found: %s", device);
-        return NULL;
+    else {
+	blk = blk_new_open(device, NULL, options, flags, &local_err);
+
+	if (!blk) {
+        	error_reportf_err(local_err, "Failed to blk_new_open '%s': ",
+                	          device);
+        	exit(EXIT_FAILURE);
+    	}
+   	//monitor_add_blk(blk, dev->tcm_dev_name, &error_fatal);
+   	monitor_add_blk(blk, "tcmu", &error_fatal);
+   	//bs = blk_bs(blk);
+
+    	exp = qemu_tcmu_export(blk, flags & BDRV_O_RDWR, &local_err);
+    	if (!exp) {
+        	error_reportf_err(local_err, "Failed to create export: ");
+        	exit(EXIT_FAILURE);
+    	}
     }
     return exp;
 }
