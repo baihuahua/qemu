@@ -21,6 +21,7 @@
 
 #include "qemu/osdep.h"
 #include "libtcmu.h"
+#include "libtcmu_priv.h"
 #include "qapi/qmp/qerror.h"
 #include "qemu/error-report.h"
 #include "sysemu/block-backend.h"
@@ -195,13 +196,15 @@ static TCMUExport *qemu_tcmu_lookup(const BlockBackend *blk)
 }
 static TCMUExport *qemu_tcmu_parse_cfgstr(const char *cfgstr,
                                           Error **errp);
+static bool qemu_tcmu_check_cfgstr(const char *cfgstr,
+                                          Error **errp);
+
 
 static bool qemu_tcmu_check_config(const char *cfgstr, char **reason)
 {
     Error *local_err = NULL;
 
-   // qemu_tcmu_parse_cfgstr(cfgstr, &local_err);
-    if (local_err) {
+    if (!qemu_tcmu_check_cfgstr(cfgstr, &local_err) && local_err) {
         *reason = strdup(error_get_pretty(local_err));
         error_free(local_err);
         return false;
@@ -220,6 +223,7 @@ static int qemu_tcmu_added(struct tcmu_device *dev)
         return -1;
     }
     exp->tcmu_dev = dev;
+    dev->hm_private = (void *)exp;
     aio_set_fd_handler(blk_get_aio_context(exp->blk),
                        tcmu_get_dev_fd(dev),
                        true, qemu_tcmu_dev_event_handler,
@@ -229,7 +233,15 @@ static int qemu_tcmu_added(struct tcmu_device *dev)
 
 static void qemu_tcmu_removed(struct tcmu_device *dev)
 {
-    /* TODO. */
+    TCMUExport *exp = (TCMUExport *)dev->hm_private;
+
+    aio_set_fd_handler(blk_get_aio_context(exp->blk),
+                       tcmu_get_dev_fd(dev),
+                       false, NULL,
+                       NULL, NULL, NULL);
+    blk_unref(exp->blk);
+    QLIST_REMOVE(exp, next);
+    g_free(exp);
 }
 
 static void qemu_tcmu_master_read(void *opaque)
@@ -248,19 +260,16 @@ static struct tcmulib_handler qemu_tcmu_handler = {
     .check_config = qemu_tcmu_check_config,
 };
 
-static TCMUExport *qemu_tcmu_parse_cfgstr(const char *cfgstr,
+static bool qemu_tcmu_check_cfgstr(const char *cfgstr,
                                           Error **errp)
 {
     BlockBackend *blk;
-    //BlockDriverState *bs;
-    const char *dev_str, *device;
+    const char *dev_str, *id, *device;
+    const char *pr;
+    char str_buf[256];
     const char *subtype = qemu_tcmu_handler.subtype;
     size_t subtype_len;
     TCMUExport *exp;
-    QDict *options = NULL;
-    int flags = BDRV_O_RDWR;
-    Error *local_err = NULL;
-    //struct tcmu_device *dev = DO_UPCAST(struct tcmu_device, cfgstring, cfgstr);
 
     if (!subtype) {
         error_setg(errp, "TCMU Handler not started");
@@ -269,33 +278,75 @@ static TCMUExport *qemu_tcmu_parse_cfgstr(const char *cfgstr,
     if (strncmp(cfgstr, subtype, subtype_len) ||
         cfgstr[subtype_len] != '/') {
         error_report("TCMU: Invalid subtype in device cfgstring: %s", cfgstr);
-        return NULL;
+        return false;
     }
     dev_str = &cfgstr[subtype_len + 1];
     if (dev_str[0] != '@') {
         error_report("TCMU: Invalid cfgstring format. Must be @<device_name>");
-        return NULL;
+        return false;
     }
     device = &dev_str[1];
 
-    blk = blk_by_name(device);
-    if (blk) {
+    pr = strchr(device, '@');
+    if (!pr) {
+	id = device;
+    	blk = blk_by_name(id);
+    	if (!blk) {
+        	error_setg(errp, "TCMU: Device not found: %s", id);
+        	return false;
+    	}
     	exp = qemu_tcmu_lookup(blk);
     	if (!exp) {
-        	error_setg(errp, "TCMU: Device not found: %s", device);
-        	return NULL;
-    	}
+        	error_setg(errp, "TCMU: Device not found: %s", id);
+        	return false;
+   	}
     }
     else {
-	blk = blk_new_open(device, NULL, options, flags, &local_err);
+	snprintf(str_buf, pr - device + 1, "%s", device);
+	id = str_buf;
+	blk = blk_by_name(id);
+        if (blk) {
+                error_setg(errp, "TCMU: Device has been added: %s", id);
+                return false;
+        }
+    }
+    return true;
+}
+
+static TCMUExport *qemu_tcmu_parse_cfgstr(const char *cfgstr,
+                                          Error **errp)
+{
+    BlockBackend *blk;
+    //BlockDriverState *bs;
+    const char *device, *id, *pr;
+    char str_buf[256];
+    const char *subtype = qemu_tcmu_handler.subtype;
+    size_t subtype_len;
+    TCMUExport *exp;
+    QDict *options = NULL;
+    int flags = BDRV_O_RDWR;
+    Error *local_err = NULL;
+
+    subtype_len = strlen(subtype);
+    device = &cfgstr[subtype_len + 2];
+
+    pr = strchr(device, '@');
+    if (!pr) {
+    	id = device;
+    	exp = qemu_tcmu_lookup(blk_by_name(id));
+    }
+    else {
+	snprintf(str_buf, pr - device + 1, "%s", device);
+	id = str_buf;
+	DPRINTF("new id is %s.\n", id);
+	blk = blk_new_open(&pr[1], NULL, options, flags, &local_err);
 
 	if (!blk) {
         	error_reportf_err(local_err, "Failed to blk_new_open '%s': ",
-                	          device);
+                	          &pr[1]);
         	exit(EXIT_FAILURE);
     	}
-   	//monitor_add_blk(blk, dev->tcm_dev_name, &error_fatal);
-   	monitor_add_blk(blk, "tcmu", &error_fatal);
+   	monitor_add_blk(blk, id, &error_fatal);
    	//bs = blk_bs(blk);
 
     	exp = qemu_tcmu_export(blk, flags & BDRV_O_RDWR, &local_err);
