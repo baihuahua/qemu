@@ -47,6 +47,7 @@
 #define QEMU_TCMU_OPT_DETECT_ZEROES 259
 #define QEMU_TCMU_OPT_OBJECT        260
 #define QEMU_TCMU_OPT_IMAGE_OPTS    261
+#define QEMU_TCMU_OPT_EXPORT	    262
 
 static TCMUExport *exp;
 static int verbose;
@@ -153,7 +154,7 @@ QemuOptsList qemu_tcmu_export_opts = {
 
 static int export_init_func(void *opaque, QemuOpts *all_opts, Error **errp)
 {
-    int bdrv_flags = BDRV_O_RDWR;
+    int flags = BDRV_O_RDWR;
     const char *buf;
     int ret = 0;
     bool writethrough;
@@ -168,10 +169,11 @@ static int export_init_func(void *opaque, QemuOpts *all_opts, Error **errp)
     QDict *bs_opts;
     bool read_only = false;
     const char *file;
+    TCMUExport *exp;
 
     value = qemu_opt_get(all_opts, "cache");
     if (value) {
-        if (bdrv_parse_cache_mode(value, &bdrv_flags, &writethrough) != 0) {
+        if (bdrv_parse_cache_mode(value, &flags, &writethrough) != 0) {
             error_report("invalid cache option");
             ret = -1;
 	    goto err_too_early;
@@ -183,11 +185,11 @@ static int export_init_func(void *opaque, QemuOpts *all_opts, Error **errp)
         }
         if (!qemu_opt_get(all_opts, BDRV_OPT_CACHE_DIRECT)) {
             qemu_opt_set_bool(all_opts, BDRV_OPT_CACHE_DIRECT,
-                              !!(bdrv_flags & BDRV_O_NOCACHE), &error_abort);
+                              !!(flags & BDRV_O_NOCACHE), &error_abort);
         }
         if (!qemu_opt_get(all_opts, BDRV_OPT_CACHE_NO_FLUSH)) {
             qemu_opt_set_bool(all_opts, BDRV_OPT_CACHE_NO_FLUSH,
-                              !!(bdrv_flags & BDRV_O_NO_FLUSH), &error_abort);
+                              !!(flags & BDRV_O_NO_FLUSH), &error_abort);
         }
         qemu_opt_unset(all_opts, "cache");
     }
@@ -217,7 +219,7 @@ static int export_init_func(void *opaque, QemuOpts *all_opts, Error **errp)
 
     if ((aio = qemu_opt_get(common_opts, "aio")) != NULL) {
             if (!strcmp(aio, "native")) {
-                bdrv_flags |= BDRV_O_NATIVE_AIO;
+                flags |= BDRV_O_NATIVE_AIO;
             } else if (!strcmp(aio, "threads")) {
                 /* this is the default */
             } else {
@@ -246,12 +248,12 @@ static int export_init_func(void *opaque, QemuOpts *all_opts, Error **errp)
 
     snapshot = qemu_opt_get_bool(common_opts, "snapshot", 0);
     if (snapshot) {
-        bdrv_flags |= BDRV_O_SNAPSHOT;
+        flags |= BDRV_O_SNAPSHOT;
     }
 
     read_only = qemu_opt_get_bool(common_opts, BDRV_OPT_READ_ONLY, false);
     if (read_only)
-	bdrv_flags &= ~BDRV_O_RDWR;
+	flags &= ~BDRV_O_RDWR;
 
     /* bdrv_open() defaults to the values in bdrv_flags (for compatibility
      * with other callers) rather than what we want as the real defaults
@@ -262,7 +264,7 @@ static int export_init_func(void *opaque, QemuOpts *all_opts, Error **errp)
                               read_only ? "on" : "off");
 
     file = qemu_opt_get(common_opts, "file");
-    blk = blk_new_open(file, NULL, bs_opts, bdrv_flags, &local_err);
+    blk = blk_new_open(file, NULL, bs_opts, flags, &local_err);
     if (!blk) {
         error_report_err(local_err);
 	ret = -1;
@@ -276,6 +278,13 @@ static int export_init_func(void *opaque, QemuOpts *all_opts, Error **errp)
     if (!monitor_add_blk(blk, id, &local_err)) {
         error_report_err(local_err);
         blk_unref(blk);
+        ret = -1;
+	goto err_no_bs_opts;
+    }
+
+    exp = qemu_tcmu_export(blk, flags & BDRV_O_RDWR, &local_err);
+    if (!exp) {
+        error_reportf_err(local_err, "Failed to create export: ");
         ret = -1;
     }
 
@@ -318,7 +327,7 @@ int main(int argc, char **argv)
         { "handler-name", required_argument, NULL, 'x' },
         { "image-opts", no_argument, NULL, QEMU_TCMU_OPT_IMAGE_OPTS },
         { "trace", required_argument, NULL, 'T' },
-        { "export", required_argument, NULL, 'X' },
+        { "export", required_argument, NULL, QEMU_TCMU_OPT_EXPORT },
         { NULL, 0, NULL, 0 }
     };
     int ch;
@@ -460,7 +469,7 @@ int main(int argc, char **argv)
             g_free(trace_file);
             trace_file = trace_opt_parse(optarg);
             break;
-	case 'X': {
+	case QEMU_TCMU_OPT_EXPORT: {
 	    QemuOpts *tcmu_opts;
 	    tcmu_opts = qemu_opts_parse_noisily(&qemu_tcmu_export_opts,
 						optarg, false);

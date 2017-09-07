@@ -230,7 +230,7 @@ static int qemu_tcmu_added(struct tcmu_device *dev)
                        NULL, NULL, exp);
     return 0;
 }
-
+/* should stop exporting or disconnect dev and export? */
 static void qemu_tcmu_removed(struct tcmu_device *dev)
 {
     TCMUExport *exp = (TCMUExport *)dev->hm_private;
