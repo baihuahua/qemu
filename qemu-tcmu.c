@@ -30,6 +30,7 @@
 #include "qemu/config-file.h"
 #include "qemu/bswap.h"
 #include "qemu/log.h"
+#include "qemu/option.h"
 #include "block/snapshot.h"
 #include "qapi/util.h"
 #include "qapi/qmp/qstring.h"
@@ -152,17 +153,29 @@ QemuOptsList qemu_tcmu_export_opts = {
 
 static int export_init_func(void *opaque, QemuOpts *all_opts, Error **errp)
 {
-    bool writethrough;
     int bdrv_flags = BDRV_O_RDWR;
-   
+    const char *buf;
+    int ret = 0;
+    bool writethrough;
+    BlockBackend *blk;
+    //BlockDriverState *bs;
+    int snapshot = 0;
+    Error *local_err = NULL;
+    QemuOpts *common_opts; 
+    const char *id;
+    const char *aio;
+    const char *value;
+    QDict *bs_opts;
+    bool read_only = false;
+    const char *file;
+
     value = qemu_opt_get(all_opts, "cache");
     if (value) {
-
         if (bdrv_parse_cache_mode(value, &bdrv_flags, &writethrough) != 0) {
             error_report("invalid cache option");
-            return NULL;
+            ret = -1;
+	    goto err_too_early;
         }
-
         /* Specific options take precedence */
         if (!qemu_opt_get(all_opts, BDRV_OPT_CACHE_WB)) {
             qemu_opt_set_bool(all_opts, BDRV_OPT_CACHE_WB,
@@ -184,44 +197,48 @@ static int export_init_func(void *opaque, QemuOpts *all_opts, Error **errp)
 
     id = qdict_get_try_str(bs_opts, "id");
     common_opts = qemu_opts_create(&qemu_tcmu_common_export_opts, id, 1,
-                                   &error_abort);
-    if (error) {
-        error_propagate(errp, error);
+                                   &local_err);
+    if (local_err) {
+        error_report_err(local_err);
+        ret = -1;
         goto err_no_opts;
     }
 
     qemu_opts_absorb_qdict(common_opts, bs_opts, &local_err);
     if (local_err) {
         error_report_err(local_err);
-        goto fail;
+	ret = -1;
+        goto early_err;
     }
 
     if (id) {
         qdict_del(bs_opts, "id");
     }
 
-
     if ((aio = qemu_opt_get(common_opts, "aio")) != NULL) {
             if (!strcmp(aio, "native")) {
-                *bdrv_flags |= BDRV_O_NATIVE_AIO;
+                bdrv_flags |= BDRV_O_NATIVE_AIO;
             } else if (!strcmp(aio, "threads")) {
                 /* this is the default */
             } else {
-               error_setg(errp, "invalid aio option");
-               return;
+               error_report("invalid aio option");
+	       ret = -1;
+               goto early_err;
             }
     }
 
     if ((buf = qemu_opt_get(common_opts, "format")) != NULL) {
-        if (is_help_option(buf)) {
+      /*  if (is_help_option(buf)) {
             error_printf("Supported formats:");
             bdrv_iterate_format(bdrv_format_print, NULL);
             error_printf("\n");
+	    ret =-1;
             goto early_err;
-        }
+        }*/
 
         if (qdict_haskey(bs_opts, "driver")) {
-            error_setg(errp, "Cannot specify both 'driver' and 'format'");
+            error_report("Cannot specify both 'driver' and 'format'");
+	    ret = -1;
             goto early_err;
         }
         qdict_put_str(bs_opts, "driver", buf);
@@ -233,7 +250,7 @@ static int export_init_func(void *opaque, QemuOpts *all_opts, Error **errp)
     }
 
     read_only = qemu_opt_get_bool(common_opts, BDRV_OPT_READ_ONLY, false);
-    if (strcmp(read_only, "on") == 0)
+    if (read_only)
 	bdrv_flags &= ~BDRV_O_RDWR;
 
     /* bdrv_open() defaults to the values in bdrv_flags (for compatibility
@@ -245,27 +262,33 @@ static int export_init_func(void *opaque, QemuOpts *all_opts, Error **errp)
                               read_only ? "on" : "off");
 
     file = qemu_opt_get(common_opts, "file");
-    blk = blk_new_open(file, NULL, bs_opts, bdrv_flags, errp);
+    blk = blk_new_open(file, NULL, bs_opts, bdrv_flags, &local_err);
     if (!blk) {
+        error_report_err(local_err);
+	ret = -1;
         goto err_no_bs_opts;
     }
-    bs = blk_bs(blk);
+   // bs = blk_bs(blk);
 
     blk_set_enable_write_cache(blk, !writethrough);
 
     id = qemu_opts_id(common_opts);
-    if (!monitor_add_blk(blk, id, errp)) {
+    if (!monitor_add_blk(blk, id, &local_err)) {
+        error_report_err(local_err);
         blk_unref(blk);
-        blk = NULL;
-        goto err_no_bs_opts;
+        ret = -1;
     }
 
 err_no_bs_opts:
-    qemu_opts_del(opts);
-    QDECREF(interval_dict);
-    QDECREF(interval_list);
-    return blk;
+    qemu_opts_del(common_opts);
+    return ret;
 
+early_err:
+    qemu_opts_del(common_opts);
+err_no_opts:
+    QDECREF(bs_opts);
+err_too_early:
+    return ret;
 }
 
 int main(int argc, char **argv)
@@ -437,14 +460,14 @@ int main(int argc, char **argv)
             g_free(trace_file);
             trace_file = trace_opt_parse(optarg);
             break;
-	case 'X':
+	case 'X': {
 	    QemuOpts *tcmu_opts;
-	    tcmu_opts = qemu_parse_opts_noisily(&qemu_tcmu_export_opts,
+	    tcmu_opts = qemu_opts_parse_noisily(&qemu_tcmu_export_opts,
 						optarg, false);
 	    if (!tcmu_opts) {
                 exit(EXIT_FAILURE);
             }
-	    break;
+	}    break;
         }
     }
 
