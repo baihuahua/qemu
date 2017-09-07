@@ -87,6 +87,8 @@ static void usage(const char *name)
 "      --discard=MODE        set discard mode (ignore, unmap)\n"
 "      --detect-zeroes=MODE  set detect-zeroes mode (off, on, unmap)\n"
 "      --image-opts          treat FILE as a full set of image options\n"
+"  --export id=ID,file=FILE,...\n"   
+"			     support multiple export images (raw, qcow2, ...)\n"
 "\n"
 "Report bugs to <qemu-devel@nongnu.org>\n"
     , name);
@@ -320,7 +322,6 @@ int main(int argc, char **argv)
         { "discard", required_argument, NULL, QEMU_TCMU_OPT_DISCARD },
         { "detect-zeroes", required_argument, NULL,
           QEMU_TCMU_OPT_DETECT_ZEROES },
-        { "shared", required_argument, NULL, 'e' },
         { "format", required_argument, NULL, 'f' },
         { "verbose", no_argument, NULL, 'v' },
         { "object", required_argument, NULL, QEMU_TCMU_OPT_OBJECT },
