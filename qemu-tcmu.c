@@ -55,7 +55,11 @@ static char *srcpath;
 static void usage(const char *name)
 {
     (printf) (
-"Usage: %s [OPTIONS] FILE\n"
+"Usage:\n" 
+"%s [OPTIONS] FILE\n"
+"%s [OPTIONS] --export id=ID1,file=FILE1,...\n"
+"	      --export id=ID2,file=FILE2,...\n"
+"	      ...\n"
 "QEMU TCMU Handler\n"
 "\n"
 "  -h, --help                display this help and exit\n"
@@ -90,7 +94,7 @@ static void usage(const char *name)
 "			     support multiple export images (raw, qcow2, ...)\n"
 "\n"
 "Report bugs to <qemu-devel@nongnu.org>\n"
-    , name);
+    , name, name);
 }
 
 static void version(const char *name)
