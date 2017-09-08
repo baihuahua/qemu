@@ -328,8 +328,8 @@ int export_init_func(void *opaque, QemuOpts *all_opts, Error **errp)
         flags &= ~BDRV_O_RDWR;
 
     /* bdrv_open() defaults to the values in bdrv_flags (for compatibility
- *      * with other callers) rather than what we want as the real defaults
- *           * Apply the defaults here instead. */
+     * with other callers) rather than what we want as the real defaults
+     * Apply the defaults here instead. */
     qdict_set_default_str(bs_opts, BDRV_OPT_CACHE_DIRECT, "off");
     qdict_set_default_str(bs_opts, BDRV_OPT_CACHE_NO_FLUSH, "off");
     qdict_set_default_str(bs_opts, BDRV_OPT_READ_ONLY,
@@ -402,7 +402,7 @@ static int qemu_tcmu_added(struct tcmu_device *dev)
                        NULL, NULL, exp);
     return 0;
 }
-/* should stop exporting or disconnect dev and export? */
+/* TODO: should stop exporting or disconnect dev and export? */
 static void qemu_tcmu_removed(struct tcmu_device *dev)
 {
     TCMUExport *exp = (TCMUExport *)dev->hm_private;
@@ -471,35 +471,25 @@ static bool qemu_tcmu_check_cfgstr(const char *cfgstr,
         	error_setg(errp, "TCMU: Device not found: %s", id);
         	return false;
    	}
-    }
-    /*else {
-	snprintf(str_buf, pr - device + 1, "%s", device);
-	id = str_buf;
-	blk = blk_by_name(id);
-        if (blk) {
-                error_setg(errp, "TCMU: Device has been added: %s", id);
-                return false;
-        }
-    }*/
+    }// TODO: else to check id?
+
     return true;
 }
 
-static char *tcmu_convert_delim(const char *opts)
+static void tcmu_convert_delim(char *to, const char *opts)
 {
-    char *dev = g_malloc0(sizeof(*opts));
-    char *p;
-    char *q = dev;
+    while (*opts != '\0') {
+	if (*opts == '@') {
+	    *to = ',';
+	} else
+	    *to = *opts;
 
-    for (p = (char *)opts; *p != '\0'; p++) {
-	if (*p == '@') {
-	    *q++ = ',';
-	    continue;
-	}
-	*q++ = *p;
+	opts++;
+	to++;
     }
-    *q = '\0';
 
-    return dev;
+    if(to)
+        *to = '\0';
 }
 static TCMUExport *qemu_tcmu_parse_cfgstr(const char *cfgstr,
                                           Error **errp)
@@ -521,9 +511,11 @@ static TCMUExport *qemu_tcmu_parse_cfgstr(const char *cfgstr,
     else {
 	QemuOpts * export_opts;
 
-	new_device = tcmu_convert_delim(device);
+	new_device = g_malloc0(strlen(device) + 1);
+	tcmu_convert_delim(new_device, device);
 	export_opts = qemu_opts_parse_noisily(&qemu_tcmu_export_opts,
 					    new_device, false);
+        g_free(new_device);
 	if (export_init_func(NULL, export_opts, NULL))
 	    goto fail;
 
@@ -532,7 +524,6 @@ static TCMUExport *qemu_tcmu_parse_cfgstr(const char *cfgstr,
     }
 
 fail:
-    g_free(new_device);
     return exp;
 }
 

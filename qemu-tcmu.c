@@ -155,6 +155,7 @@ int main(int argc, char **argv)
     bool seen_cache = false;
     bool seen_discard = false;
     bool seen_aio = false;
+    bool seen_export = false;
     const char *fmt = NULL;
     Error *local_err = NULL;
     BlockdevDetectZeroesOptions detect_zeroes = BLOCKDEV_DETECT_ZEROES_OPTIONS_OFF;
@@ -289,6 +290,8 @@ int main(int argc, char **argv)
             break;
 	case QEMU_TCMU_OPT_EXPORT: {
 	    QemuOpts *tcmu_opts;
+
+	    seen_export = true;
 	    tcmu_opts = qemu_opts_parse_noisily(&qemu_tcmu_export_opts,
 						optarg, false);
 	    if (!tcmu_opts) {
@@ -296,12 +299,6 @@ int main(int argc, char **argv)
             }
 	}    break;
         }
-    }
-
-    if ((argc - optind) != 1) {
-        error_report("Invalid number of arguments");
-        error_printf("Try `%s --help' for more information.\n", argv[0]);
-        exit(EXIT_FAILURE);
     }
 
     if (qemu_opts_foreach(&qemu_object_opts,
@@ -323,63 +320,71 @@ int main(int argc, char **argv)
     bdrv_init();
     atexit(bdrv_close_all);
 
-    if (qemu_opts_foreach(&qemu_tcmu_export_opts, export_init_func,
-			  NULL, NULL))
+    if (seen_export) {
+        if (qemu_opts_foreach(&qemu_tcmu_export_opts, export_init_func,
+							  NULL, NULL))
 	exit(0);
-
-    srcpath = argv[optind];
-    if (imageOpts) {
-        QemuOpts *opts;
-        if (fmt) {
-            error_report("--image-opts and -f are mutually exclusive");
-            exit(EXIT_FAILURE);
-        }
-        opts = qemu_opts_parse_noisily(&file_opts, srcpath, true);
-        if (!opts) {
-            qemu_opts_reset(&file_opts);
-            exit(EXIT_FAILURE);
-        }
-        options = qemu_opts_to_qdict(opts, NULL);
-        qemu_opts_reset(&file_opts);
-        blk = blk_new_open(NULL, NULL, options, flags, &local_err);
     } else {
-        if (fmt) {
-            options = qdict_new();
-            qdict_put(options, "driver", qstring_from_str(fmt));
+        if ((argc - optind) != 1) {
+            error_report("Invalid number of arguments");
+            error_printf("Try `%s --help' for more information.\n", argv[0]);
+            exit(EXIT_FAILURE);
         }
-        blk = blk_new_open(srcpath, NULL, options, flags, &local_err);
-    }
 
-    if (!blk) {
-        error_reportf_err(local_err, "Failed to blk_new_open '%s': ",
-                          argv[optind]);
-        exit(EXIT_FAILURE);
-    }
-    monitor_add_blk(blk, "drive", &error_fatal);
-    bs = blk_bs(blk);
+    	srcpath = argv[optind];
+    	if (imageOpts) {
+            QemuOpts *opts;
+            if (fmt) {
+                error_report("--image-opts and -f are mutually exclusive");
+                exit(EXIT_FAILURE);
+            }
+            opts = qemu_opts_parse_noisily(&file_opts, srcpath, true);
+            if (!opts) {
+                qemu_opts_reset(&file_opts);
+                exit(EXIT_FAILURE);
+            }
+            options = qemu_opts_to_qdict(opts, NULL);
+            qemu_opts_reset(&file_opts);
+            blk = blk_new_open(NULL, NULL, options, flags, &local_err);
+    	} else {
+            if (fmt) {
+                options = qdict_new();
+                qdict_put(options, "driver", qstring_from_str(fmt));
+            }
+            blk = blk_new_open(srcpath, NULL, options, flags, &local_err);
+        }
 
-    blk_set_enable_write_cache(blk, !writethrough);
+        if (!blk) {
+            error_reportf_err(local_err, "Failed to blk_new_open '%s': ",
+                              argv[optind]);
+            exit(EXIT_FAILURE);
+        }
+        monitor_add_blk(blk, "drive", &error_fatal);
+        bs = blk_bs(blk);
 
-    if (sn_opts) {
-        ret = bdrv_snapshot_load_tmp(bs,
+        blk_set_enable_write_cache(blk, !writethrough);
+
+        if (sn_opts) {
+            ret = bdrv_snapshot_load_tmp(bs,
                                      qemu_opt_get(sn_opts, SNAPSHOT_OPT_ID),
                                      qemu_opt_get(sn_opts, SNAPSHOT_OPT_NAME),
                                      &local_err);
-    } else if (sn_id_or_name) {
-        ret = bdrv_snapshot_load_tmp_by_id_or_name(bs, sn_id_or_name,
-                                                   &local_err);
-    }
-    if (ret < 0) {
-        error_reportf_err(local_err, "Failed to load snapshot: ");
-        exit(EXIT_FAILURE);
-    }
+        } else if (sn_id_or_name) {
+            ret = bdrv_snapshot_load_tmp_by_id_or_name(bs, sn_id_or_name,
+                                                       &local_err);
+        }
+        if (ret < 0) {
+            error_reportf_err(local_err, "Failed to load snapshot: ");
+            exit(EXIT_FAILURE);
+        }
 
-    bs->detect_zeroes = detect_zeroes;
-    exp = qemu_tcmu_export(blk, flags & BDRV_O_RDWR, &local_err);
-    if (!exp) {
-        error_reportf_err(local_err, "Failed to create export: ");
-        exit(EXIT_FAILURE);
-    }
+        bs->detect_zeroes = detect_zeroes;
+        exp = qemu_tcmu_export(blk, flags & BDRV_O_RDWR, &local_err);
+        if (!exp) {
+            error_reportf_err(local_err, "Failed to create export: ");
+            exit(EXIT_FAILURE);
+        }
+    }//if (seen_export)
 
     /* now when the initialization is (almost) complete, chdir("/")
      * to free any busy filesystems */
@@ -408,9 +413,9 @@ int main(int argc, char **argv)
         }
     } while (state != TERMINATED);
 
-    blk_unref(blk);
-
-    qemu_opts_del(sn_opts);
-
+    if(!seen_export) {
+    	blk_unref(blk);
+	qemu_opts_del(sn_opts);
+    }
     exit(EXIT_SUCCESS);
 }
