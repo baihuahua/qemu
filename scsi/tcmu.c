@@ -29,7 +29,10 @@
 #include "block/scsi.h"
 #include "scsi/tcmu.h"
 #include "qemu/main-loop.h"
+#include "qemu/option.h"
 #include "qmp-commands.h"
+#include "qapi/qmp/qstring.h"
+
 
 #include "qemu/compiler.h"
 #define TCMU_DEBUG 1
@@ -199,6 +202,175 @@ static TCMUExport *qemu_tcmu_parse_cfgstr(const char *cfgstr,
 static bool qemu_tcmu_check_cfgstr(const char *cfgstr,
                                           Error **errp);
 
+QemuOptsList qemu_tcmu_common_export_opts = {
+    .name = "export",
+    .head = QTAILQ_HEAD_INITIALIZER(qemu_tcmu_common_export_opts.head),
+    .desc = {
+        {
+            .name = "snapshot",
+            .type = QEMU_OPT_BOOL,
+            .help = "enable/disable snapshot mode",
+        },{
+            .name = "aio",
+            .type = QEMU_OPT_STRING,
+            .help = "host AIO implementation (threads, native)",
+        },{
+            .name = "format",
+            .type = QEMU_OPT_STRING,
+            .help = "disk format (raw, qcow2, ...)",
+        },{
+            .name = "file",
+            .type = QEMU_OPT_STRING,
+            .help = "file name",
+        },
+        { /* end of list */ }
+    },
+};
+
+QemuOptsList qemu_tcmu_export_opts = {
+    .name = "export",
+    .head = QTAILQ_HEAD_INITIALIZER(qemu_tcmu_export_opts.head),
+    .desc = {
+        /* no elements => accept any params */
+        { /* end of list */ }
+    },
+};
+
+int export_init_func(void *opaque, QemuOpts *all_opts, Error **errp)
+{
+    int flags = BDRV_O_RDWR;
+    const char *buf;
+    int ret = 0;
+    bool writethrough;
+    BlockBackend *blk;
+    //BlockDriverState *bs;
+    int snapshot = 0;
+    Error *local_err = NULL;
+    QemuOpts *common_opts;
+    const char *id;
+    const char *aio;
+    const char *value;
+    QDict *bs_opts;
+    bool read_only = false;
+    const char *file;
+    TCMUExport *exp;
+
+    value = qemu_opt_get(all_opts, "cache");
+    if (value) {
+        if (bdrv_parse_cache_mode(value, &flags, &writethrough) != 0) {
+            error_report("invalid cache option");
+            ret = -1;
+            goto err_too_early;
+        }
+        /* Specific options take precedence */
+        if (!qemu_opt_get(all_opts, BDRV_OPT_CACHE_DIRECT)) {
+            qemu_opt_set_bool(all_opts, BDRV_OPT_CACHE_DIRECT,
+                              !!(flags & BDRV_O_NOCACHE), &error_abort);
+        }
+        if (!qemu_opt_get(all_opts, BDRV_OPT_CACHE_NO_FLUSH)) {
+            qemu_opt_set_bool(all_opts, BDRV_OPT_CACHE_NO_FLUSH,
+                              !!(flags & BDRV_O_NO_FLUSH), &error_abort);
+        }
+        qemu_opt_unset(all_opts, "cache");
+    }
+
+    bs_opts = qdict_new();
+    qemu_opts_to_qdict(all_opts, bs_opts);
+
+    id = qdict_get_try_str(bs_opts, "id");
+    common_opts = qemu_opts_create(&qemu_tcmu_common_export_opts, id, 1,
+                                   &local_err);
+    if (local_err) {
+        error_report_err(local_err);
+        ret = -1;
+        goto err_no_opts;
+    }
+
+    qemu_opts_absorb_qdict(common_opts, bs_opts, &local_err);
+    if (local_err) {
+        error_report_err(local_err);
+        ret = -1;
+        goto early_err;
+    }
+
+    if (id) {
+        qdict_del(bs_opts, "id");
+    }
+
+    if ((aio = qemu_opt_get(common_opts, "aio")) != NULL) {
+            if (!strcmp(aio, "native")) {
+                flags |= BDRV_O_NATIVE_AIO;
+            } else if (!strcmp(aio, "threads")) {
+                /* this is the default */
+            } else {
+               error_report("invalid aio option");
+               ret = -1;
+               goto early_err;
+            }
+    }
+
+    if ((buf = qemu_opt_get(common_opts, "format")) != NULL) {
+        if (qdict_haskey(bs_opts, "driver")) {
+            error_report("Cannot specify both 'driver' and 'format'");
+            ret = -1;
+            goto early_err;
+        }
+        qdict_put_str(bs_opts, "driver", buf);
+    }
+
+    snapshot = qemu_opt_get_bool(common_opts, "snapshot", 0);
+    if (snapshot) {
+        flags |= BDRV_O_SNAPSHOT;
+    }
+
+    read_only = qemu_opt_get_bool(common_opts, BDRV_OPT_READ_ONLY, false);
+    if (read_only)
+        flags &= ~BDRV_O_RDWR;
+
+    /* bdrv_open() defaults to the values in bdrv_flags (for compatibility
+ *      * with other callers) rather than what we want as the real defaults
+ *           * Apply the defaults here instead. */
+    qdict_set_default_str(bs_opts, BDRV_OPT_CACHE_DIRECT, "off");
+    qdict_set_default_str(bs_opts, BDRV_OPT_CACHE_NO_FLUSH, "off");
+    qdict_set_default_str(bs_opts, BDRV_OPT_READ_ONLY,
+                              read_only ? "on" : "off");
+
+    file = qemu_opt_get(common_opts, "file");
+    blk = blk_new_open(file, NULL, bs_opts, flags, &local_err);
+    if (!blk) {
+        error_report_err(local_err);
+        ret = -1;
+        goto err_no_bs_opts;
+    }
+   // bs = blk_bs(blk);
+
+    blk_set_enable_write_cache(blk, !writethrough);
+
+    id = qemu_opts_id(common_opts);
+    if (!monitor_add_blk(blk, id, &local_err)) {
+        error_report_err(local_err);
+        blk_unref(blk);
+        ret = -1;
+        goto err_no_bs_opts;
+    }
+
+    exp = qemu_tcmu_export(blk, flags & BDRV_O_RDWR, &local_err);
+    if (!exp) {
+        error_reportf_err(local_err, "Failed to create export: ");
+        ret = -1;
+    }
+
+err_no_bs_opts:
+    qemu_opts_del(common_opts);
+    return ret;
+
+early_err:
+    qemu_opts_del(common_opts);
+err_no_opts:
+    QDECREF(bs_opts);
+err_too_early:
+    return ret;
+}
 
 static bool qemu_tcmu_check_config(const char *cfgstr, char **reason)
 {
@@ -219,7 +391,7 @@ static int qemu_tcmu_added(struct tcmu_device *dev)
     Error *local_err = NULL;
 
     exp = qemu_tcmu_parse_cfgstr(cfgstr, &local_err);
-    if (local_err) {
+    if (!exp) {
         return -1;
     }
     exp->tcmu_dev = dev;
@@ -266,7 +438,6 @@ static bool qemu_tcmu_check_cfgstr(const char *cfgstr,
     BlockBackend *blk;
     const char *dev_str, *id, *device;
     const char *pr;
-    char str_buf[256];
     const char *subtype = qemu_tcmu_handler.subtype;
     size_t subtype_len;
     TCMUExport *exp;
@@ -301,7 +472,7 @@ static bool qemu_tcmu_check_cfgstr(const char *cfgstr,
         	return false;
    	}
     }
-    else {
+    /*else {
 	snprintf(str_buf, pr - device + 1, "%s", device);
 	id = str_buf;
 	blk = blk_by_name(id);
@@ -309,23 +480,35 @@ static bool qemu_tcmu_check_cfgstr(const char *cfgstr,
                 error_setg(errp, "TCMU: Device has been added: %s", id);
                 return false;
         }
-    }
+    }*/
     return true;
 }
 
+static char *tcmu_convert_delim(const char *opts)
+{
+    char *dev = g_malloc0(sizeof(*opts));
+    char *p;
+    char *q = dev;
+
+    for (p = (char *)opts; *p != '\0'; p++) {
+	if (*p == '@') {
+	    *q++ = ',';
+	    continue;
+	}
+	*q++ = *p;
+    }
+    *q = '\0';
+
+    return dev;
+}
 static TCMUExport *qemu_tcmu_parse_cfgstr(const char *cfgstr,
                                           Error **errp)
 {
-    BlockBackend *blk;
-    //BlockDriverState *bs;
     const char *device, *id, *pr;
-    char str_buf[256];
     const char *subtype = qemu_tcmu_handler.subtype;
     size_t subtype_len;
-    TCMUExport *exp;
-    QDict *options = NULL;
-    int flags = BDRV_O_RDWR;
-    Error *local_err = NULL;
+    TCMUExport *exp = NULL;
+    char *new_device;
 
     subtype_len = strlen(subtype);
     device = &cfgstr[subtype_len + 2];
@@ -336,25 +519,20 @@ static TCMUExport *qemu_tcmu_parse_cfgstr(const char *cfgstr,
     	exp = qemu_tcmu_lookup(blk_by_name(id));
     }
     else {
-	snprintf(str_buf, pr - device + 1, "%s", device);
-	id = str_buf;
-	DPRINTF("new id is %s.\n", id);
-	blk = blk_new_open(&pr[1], NULL, options, flags, &local_err);
+	QemuOpts * export_opts;
 
-	if (!blk) {
-        	error_reportf_err(local_err, "Failed to blk_new_open '%s': ",
-                	          &pr[1]);
-        	exit(EXIT_FAILURE);
-    	}
-   	monitor_add_blk(blk, id, &error_fatal);
-   	//bs = blk_bs(blk);
+	new_device = tcmu_convert_delim(device);
+	export_opts = qemu_opts_parse_noisily(&qemu_tcmu_export_opts,
+					    new_device, false);
+	if (export_init_func(NULL, export_opts, NULL))
+	    goto fail;
 
-    	exp = qemu_tcmu_export(blk, flags & BDRV_O_RDWR, &local_err);
-    	if (!exp) {
-        	error_reportf_err(local_err, "Failed to create export: ");
-        	exit(EXIT_FAILURE);
-    	}
+	id = qemu_opts_id(export_opts);
+	exp = qemu_tcmu_lookup(blk_by_name(id));
     }
+
+fail:
+    g_free(new_device);
     return exp;
 }
 
