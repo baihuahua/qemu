@@ -105,6 +105,7 @@
 /qemu-doc.txt
 /qemu-img
 /qemu-nbd
+/qemu-tcmu
 /qemu-options.def
 /qemu-options.texi
 /qemu-img-cmds.texi
