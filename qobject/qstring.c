@@ -11,7 +11,6 @@
  */
 
 #include "qemu/osdep.h"
-#include "qapi/qmp/qobject.h"
 #include "qapi/qmp/qstring.h"
 #include "qemu-common.h"
 
@@ -126,6 +125,15 @@ QString *qobject_to_qstring(const QObject *obj)
 const char *qstring_get_str(const QString *qstring)
 {
     return qstring->string;
+}
+
+/**
+ * qstring_is_equal(): Test whether the two QStrings are equal
+ */
+bool qstring_is_equal(const QObject *x, const QObject *y)
+{
+    return !strcmp(qobject_to_qstring(x)->string,
+                   qobject_to_qstring(y)->string);
 }
 
 /**

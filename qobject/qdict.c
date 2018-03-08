@@ -14,8 +14,9 @@
 #include "qapi/qmp/qnum.h"
 #include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qbool.h"
+#include "qapi/qmp/qlist.h"
+#include "qapi/qmp/qnull.h"
 #include "qapi/qmp/qstring.h"
-#include "qapi/qmp/qobject.h"
 #include "qapi/error.h"
 #include "qemu/queue.h"
 #include "qemu-common.h"
@@ -141,6 +142,26 @@ void qdict_put_obj(QDict *qdict, const char *key, QObject *value)
         QLIST_INSERT_HEAD(&qdict->table[bucket], entry, next);
         qdict->size++;
     }
+}
+
+void qdict_put_int(QDict *qdict, const char *key, int64_t value)
+{
+    qdict_put(qdict, key, qnum_from_int(value));
+}
+
+void qdict_put_bool(QDict *qdict, const char *key, bool value)
+{
+    qdict_put(qdict, key, qbool_from_bool(value));
+}
+
+void qdict_put_str(QDict *qdict, const char *key, const char *value)
+{
+    qdict_put(qdict, key, qstring_from_str(value));
+}
+
+void qdict_put_null(QDict *qdict, const char *key)
+{
+    qdict_put(qdict, key, qnull());
 }
 
 /**
@@ -400,6 +421,35 @@ void qdict_del(QDict *qdict, const char *key)
         qentry_destroy(entry);
         qdict->size--;
     }
+}
+
+/**
+ * qdict_is_equal(): Test whether the two QDicts are equal
+ *
+ * Here, equality means whether they contain the same keys and whether
+ * the respective values are in turn equal (i.e. invoking
+ * qobject_is_equal() on them yields true).
+ */
+bool qdict_is_equal(const QObject *x, const QObject *y)
+{
+    const QDict *dict_x = qobject_to_qdict(x);
+    const QDict *dict_y = qobject_to_qdict(y);
+    const QDictEntry *e;
+
+    if (qdict_size(dict_x) != qdict_size(dict_y)) {
+        return false;
+    }
+
+    for (e = qdict_first(dict_x); e; e = qdict_next(dict_x, e)) {
+        const QObject *obj_x = qdict_entry_value(e);
+        const QObject *obj_y = qdict_get(dict_y, qdict_entry_key(e));
+
+        if (!qobject_is_equal(obj_x, obj_y)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 /**

@@ -26,6 +26,7 @@
 #define THROTTLE_H
 
 #include "qemu-common.h"
+#include "qapi/qapi-types-block-core.h"
 #include "qemu/timer.h"
 
 #define THROTTLE_VALUE_MAX 1000000000000000LL
@@ -152,5 +153,8 @@ bool throttle_schedule_timer(ThrottleState *ts,
                              bool is_write);
 
 void throttle_account(ThrottleState *ts, bool is_write, uint64_t size);
+void throttle_limits_to_config(ThrottleLimits *arg, ThrottleConfig *cfg,
+                               Error **errp);
+void throttle_config_to_limits(ThrottleConfig *cfg, ThrottleLimits *var);
 
 #endif

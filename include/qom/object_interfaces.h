@@ -2,7 +2,6 @@
 #define OBJECT_INTERFACES_H
 
 #include "qom/object.h"
-#include "qapi/qmp/qdict.h"
 #include "qapi/visitor.h"
 
 #define TYPE_USER_CREATABLE "user-creatable"
@@ -146,5 +145,13 @@ int user_creatable_add_opts_foreach(void *opaque,
  * by @id.
  */
 void user_creatable_del(const char *id, Error **errp);
+
+/**
+ * user_creatable_cleanup:
+ *
+ * Delete all user-creatable objects and the user-creatable
+ * objects container.
+ */
+void user_creatable_cleanup(void);
 
 #endif

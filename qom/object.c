@@ -16,17 +16,17 @@
 #include "qom/object_interfaces.h"
 #include "qemu/cutils.h"
 #include "qapi/visitor.h"
-#include "qapi-visit.h"
 #include "qapi/string-input-visitor.h"
 #include "qapi/string-output-visitor.h"
+#include "qapi/qapi-builtin-visit.h"
 #include "qapi/qmp/qerror.h"
 #include "trace.h"
 
 /* TODO: replace QObject with a simpler visitor to avoid a dependency
  * of the QOM core on QObject?  */
 #include "qom/qom-qobject.h"
-#include "qapi/qmp/qobject.h"
 #include "qapi/qmp/qbool.h"
+#include "qapi/qmp/qnum.h"
 #include "qapi/qmp/qstring.h"
 
 #define MAX_INTERFACES 32
@@ -149,6 +149,15 @@ TypeImpl *type_register(const TypeInfo *info)
 TypeImpl *type_register_static(const TypeInfo *info)
 {
     return type_register(info);
+}
+
+void type_register_static_array(const TypeInfo *infos, int nr_infos)
+{
+    int i;
+
+    for (i = 0; i < nr_infos; i++) {
+        type_register_static(&infos[i]);
+    }
 }
 
 static TypeImpl *type_get_by_name(const char *name)
@@ -1028,6 +1037,13 @@ ObjectProperty *object_property_iter_next(ObjectPropertyIterator *iter)
     return val;
 }
 
+void object_class_property_iter_init(ObjectPropertyIterator *iter,
+                                     ObjectClass *klass)
+{
+    g_hash_table_iter_init(&iter->iter, klass->properties);
+    iter->nextclass = klass;
+}
+
 ObjectProperty *object_class_property_find(ObjectClass *klass, const char *name,
                                            Error **errp)
 {
@@ -1368,6 +1384,17 @@ Object *object_get_root(void)
 Object *object_get_objects_root(void)
 {
     return container_get(object_get_root(), "/objects");
+}
+
+Object *object_get_internal_root(void)
+{
+    static Object *internal_root;
+
+    if (!internal_root) {
+        internal_root = object_new("container");
+    }
+
+    return internal_root;
 }
 
 static void object_get_child_property(Object *obj, Visitor *v,

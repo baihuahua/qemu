@@ -3,14 +3,13 @@
 
 #include "ui/qemu-pixman.h"
 #include "qom/object.h"
-#include "qapi/qmp/qdict.h"
 #include "qemu/notify.h"
-#include "qapi-types.h"
 #include "qemu/error-report.h"
-#include "qapi/error.h"
+#include "qapi/qapi-types-ui.h"
 
 #ifdef CONFIG_OPENGL
 # include <epoxy/gl.h>
+# include "ui/shader.h"
 #endif
 
 /* keyboard/mouse support */
@@ -180,6 +179,15 @@ struct QEMUGLParams {
     int minor_ver;
 };
 
+struct QemuDmaBuf {
+    int       fd;
+    uint32_t  width;
+    uint32_t  height;
+    uint32_t  stride;
+    uint32_t  fourcc;
+    uint32_t  texture;
+};
+
 typedef struct DisplayChangeListenerOps {
     const char *dpy_name;
 
@@ -220,6 +228,15 @@ typedef struct DisplayChangeListenerOps {
                                    uint32_t backing_height,
                                    uint32_t x, uint32_t y,
                                    uint32_t w, uint32_t h);
+    void (*dpy_gl_scanout_dmabuf)(DisplayChangeListener *dcl,
+                                  QemuDmaBuf *dmabuf);
+    void (*dpy_gl_cursor_dmabuf)(DisplayChangeListener *dcl,
+                                 QemuDmaBuf *dmabuf, bool have_hot,
+                                 uint32_t hot_x, uint32_t hot_y);
+    void (*dpy_gl_cursor_position)(DisplayChangeListener *dcl,
+                                   uint32_t pos_x, uint32_t pos_y);
+    void (*dpy_gl_release_dmabuf)(DisplayChangeListener *dcl,
+                                  QemuDmaBuf *dmabuf);
     void (*dpy_gl_update)(DisplayChangeListener *dcl,
                           uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 
@@ -288,6 +305,14 @@ void dpy_gl_scanout_texture(QemuConsole *con,
                             uint32_t backing_id, bool backing_y_0_top,
                             uint32_t backing_width, uint32_t backing_height,
                             uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+void dpy_gl_scanout_dmabuf(QemuConsole *con,
+                           QemuDmaBuf *dmabuf);
+void dpy_gl_cursor_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf,
+                          bool have_hot, uint32_t hot_x, uint32_t hot_y);
+void dpy_gl_cursor_position(QemuConsole *con,
+                            uint32_t pos_x, uint32_t pos_y);
+void dpy_gl_release_dmabuf(QemuConsole *con,
+                           QemuDmaBuf *dmabuf);
 void dpy_gl_update(QemuConsole *con,
                    uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 
@@ -298,6 +323,7 @@ int dpy_gl_ctx_make_current(QemuConsole *con, QEMUGLContext ctx);
 QEMUGLContext dpy_gl_ctx_get_current(QemuConsole *con);
 
 bool console_has_gl(QemuConsole *con);
+bool console_has_gl_dmabuf(QemuConsole *con);
 
 static inline int surface_stride(DisplaySurface *s)
 {
@@ -336,29 +362,10 @@ static inline pixman_format_code_t surface_format(DisplaySurface *s)
     return s->format;
 }
 
-#ifdef CONFIG_CURSES
-/* KEY_EVENT is defined in wincon.h and in curses.h. Avoid redefinition. */
-#undef KEY_EVENT
-#include <curses.h>
-#undef KEY_EVENT
-typedef chtype console_ch_t;
-extern chtype vga_to_curses[];
-#else
-typedef unsigned long console_ch_t;
-#endif
+typedef uint32_t console_ch_t;
+
 static inline void console_write_ch(console_ch_t *dest, uint32_t ch)
 {
-    uint8_t c = ch;
-#ifdef CONFIG_CURSES
-    if (vga_to_curses[c]) {
-        ch &= ~(console_ch_t)0xff;
-        ch |= vga_to_curses[c];
-    }
-#else
-    if (c == '\0') {
-        ch |= ' ';
-    }
-#endif
     *dest = ch;
 }
 
@@ -409,125 +416,46 @@ void qemu_console_resize(QemuConsole *con, int width, int height);
 DisplaySurface *qemu_console_surface(QemuConsole *con);
 
 /* console-gl.c */
-typedef struct ConsoleGLState ConsoleGLState;
 #ifdef CONFIG_OPENGL
-ConsoleGLState *console_gl_init_context(void);
-void console_gl_fini_context(ConsoleGLState *gls);
 bool console_gl_check_format(DisplayChangeListener *dcl,
                              pixman_format_code_t format);
-void surface_gl_create_texture(ConsoleGLState *gls,
+void surface_gl_create_texture(QemuGLShader *gls,
                                DisplaySurface *surface);
-void surface_gl_update_texture(ConsoleGLState *gls,
+void surface_gl_update_texture(QemuGLShader *gls,
                                DisplaySurface *surface,
                                int x, int y, int w, int h);
-void surface_gl_render_texture(ConsoleGLState *gls,
+void surface_gl_render_texture(QemuGLShader *gls,
                                DisplaySurface *surface);
-void surface_gl_destroy_texture(ConsoleGLState *gls,
+void surface_gl_destroy_texture(QemuGLShader *gls,
                                DisplaySurface *surface);
-void surface_gl_setup_viewport(ConsoleGLState *gls,
+void surface_gl_setup_viewport(QemuGLShader *gls,
                                DisplaySurface *surface,
                                int ww, int wh);
 #endif
 
-/* sdl.c */
-#ifdef CONFIG_SDL
-void sdl_display_early_init(int opengl);
-void sdl_display_init(DisplayState *ds, int full_screen, int no_frame);
-#else
-static inline void sdl_display_early_init(int opengl)
-{
-    /* This must never be called if CONFIG_SDL is disabled */
-    error_report("SDL support is disabled");
-    abort();
-}
-static inline void sdl_display_init(DisplayState *ds, int full_screen,
-                                    int no_frame)
-{
-    /* This must never be called if CONFIG_SDL is disabled */
-    error_report("SDL support is disabled");
-    abort();
-}
-#endif
+typedef struct QemuDisplay QemuDisplay;
 
-/* cocoa.m */
-#ifdef CONFIG_COCOA
-void cocoa_display_init(DisplayState *ds, int full_screen);
-#else
-static inline void cocoa_display_init(DisplayState *ds, int full_screen)
-{
-    /* This must never be called if CONFIG_COCOA is disabled */
-    error_report("Cocoa support is disabled");
-    abort();
-}
-#endif
+struct QemuDisplay {
+    DisplayType type;
+    void (*early_init)(DisplayOptions *opts);
+    void (*init)(DisplayState *ds, DisplayOptions *opts);
+};
+
+void qemu_display_register(QemuDisplay *ui);
+bool qemu_display_find_default(DisplayOptions *opts);
+void qemu_display_early_init(DisplayOptions *opts);
+void qemu_display_init(DisplayState *ds, DisplayOptions *opts);
 
 /* vnc.c */
 void vnc_display_init(const char *id);
 void vnc_display_open(const char *id, Error **errp);
 void vnc_display_add_client(const char *id, int csock, bool skipauth);
-#ifdef CONFIG_VNC
 int vnc_display_password(const char *id, const char *password);
 int vnc_display_pw_expire(const char *id, time_t expires);
 QemuOpts *vnc_parse(const char *str, Error **errp);
 int vnc_init_func(void *opaque, QemuOpts *opts, Error **errp);
-#else
-static inline int vnc_display_password(const char *id, const char *password)
-{
-    return -ENODEV;
-}
-static inline int vnc_display_pw_expire(const char *id, time_t expires)
-{
-    return -ENODEV;
-};
-static inline QemuOpts *vnc_parse(const char *str, Error **errp)
-{
-    error_setg(errp, "VNC support is disabled");
-    return NULL;
-}
-static inline int vnc_init_func(void *opaque, QemuOpts *opts, Error **errp)
-{
-    error_setg(errp, "VNC support is disabled");
-    return -1;
-}
-#endif
-
-/* curses.c */
-#ifdef CONFIG_CURSES
-void curses_display_init(DisplayState *ds, int full_screen);
-#else
-static inline void curses_display_init(DisplayState *ds, int full_screen)
-{
-    /* This must never be called if CONFIG_CURSES is disabled */
-    error_report("curses support is disabled");
-    abort();
-}
-#endif
 
 /* input.c */
 int index_from_key(const char *key, size_t key_length);
-
-/* gtk.c */
-#ifdef CONFIG_GTK
-void early_gtk_display_init(int opengl);
-void gtk_display_init(DisplayState *ds, bool full_screen, bool grab_on_hover);
-#else
-static inline void gtk_display_init(DisplayState *ds, bool full_screen,
-                                    bool grab_on_hover)
-{
-    /* This must never be called if CONFIG_GTK is disabled */
-    error_report("GTK support is disabled");
-    abort();
-}
-
-static inline void early_gtk_display_init(int opengl)
-{
-    /* This must never be called if CONFIG_GTK is disabled */
-    error_report("GTK support is disabled");
-    abort();
-}
-#endif
-
-/* egl-headless.c */
-void egl_headless_init(void);
 
 #endif

@@ -21,9 +21,10 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include "qemu-common.h"
+#include "qemu/option.h"
 #include "chardev/char.h"
 #include "sysemu/block-backend.h"
 #include "chardev/char-mux.h"
@@ -120,6 +121,15 @@ static void mux_chr_send_event(MuxChardev *d, int mux_nr, int event)
 
     if (be && be->chr_event) {
         be->chr_event(be->opaque, event);
+    }
+}
+
+static void mux_chr_be_event(Chardev *chr, int event)
+{
+    MuxChardev *d = MUX_CHARDEV(chr);
+
+    if (d->focus != -1) {
+        mux_chr_send_event(d, d->focus, event);
     }
 }
 
@@ -346,6 +356,7 @@ static void char_mux_class_init(ObjectClass *oc, void *data)
     cc->chr_write = mux_chr_write;
     cc->chr_accept_input = mux_chr_accept_input;
     cc->chr_add_watch = mux_chr_add_watch;
+    cc->chr_be_event = mux_chr_be_event;
 }
 
 static const TypeInfo char_mux_type_info = {

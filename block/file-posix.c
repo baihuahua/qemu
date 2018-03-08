@@ -21,17 +21,23 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "block/block_int.h"
 #include "qemu/module.h"
+#include "qemu/option.h"
 #include "trace.h"
 #include "block/thread-pool.h"
 #include "qemu/iov.h"
 #include "block/raw-aio.h"
+#include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qstring.h"
+
+#include "scsi/pr-manager.h"
+#include "scsi/constants.h"
 
 #if defined(__APPLE__) && (__MACH__)
 #include <paths.h>
@@ -155,6 +161,8 @@ typedef struct BDRVRawState {
     bool page_cache_inconsistent:1;
     bool has_fallocate;
     bool needs_alignment;
+
+    PRManager *pr_mgr;
 } BDRVRawState;
 
 typedef struct BDRVRawReopenState {
@@ -402,6 +410,11 @@ static QemuOptsList raw_runtime_opts = {
             .type = QEMU_OPT_STRING,
             .help = "file locking mode (on/off/auto, default: auto)",
         },
+        {
+            .name = "pr-manager",
+            .type = QEMU_OPT_STRING,
+            .help = "id of persistent reservation manager object (default: none)",
+        },
         { /* end of list */ }
     },
 };
@@ -413,6 +426,7 @@ static int raw_open_common(BlockDriverState *bs, QDict *options,
     QemuOpts *opts;
     Error *local_err = NULL;
     const char *filename = NULL;
+    const char *str;
     BlockdevAioOptions aio, aio_default;
     int fd, ret;
     struct stat st;
@@ -476,6 +490,16 @@ static int raw_open_common(BlockDriverState *bs, QDict *options,
         abort();
     }
 
+    str = qemu_opt_get(opts, "pr-manager");
+    if (str) {
+        s->pr_mgr = pr_manager_lookup(str, &local_err);
+        if (local_err) {
+            error_propagate(errp, local_err);
+            ret = -EINVAL;
+            goto fail;
+        }
+    }
+
     s->open_flags = open_flags;
     raw_parse_flags(bdrv_flags, &s->open_flags);
 
@@ -525,7 +549,6 @@ static int raw_open_common(BlockDriverState *bs, QDict *options,
 
     s->has_discard = true;
     s->has_write_zeroes = true;
-    bs->supported_zero_flags = BDRV_REQ_MAY_UNMAP;
     if ((bs->open_flags & BDRV_O_NOCACHE) != 0) {
         s->needs_alignment = true;
     }
@@ -575,6 +598,7 @@ static int raw_open_common(BlockDriverState *bs, QDict *options,
     }
 #endif
 
+    bs->supported_zero_flags = s->discard_zeroes ? BDRV_REQ_MAY_UNMAP : 0;
     ret = 0;
 fail:
     if (filename && (bdrv_flags & BDRV_O_TEMPORARY)) {
@@ -1958,7 +1982,8 @@ static int64_t raw_get_allocated_file_size(BlockDriverState *bs)
     return (int64_t)st.st_blocks * 512;
 }
 
-static int raw_create(const char *filename, QemuOpts *opts, Error **errp)
+static int coroutine_fn raw_co_create_opts(const char *filename, QemuOpts *opts,
+                                           Error **errp)
 {
     int fd;
     int result = 0;
@@ -2107,25 +2132,24 @@ static int find_allocation(BlockDriverState *bs, off_t start,
 }
 
 /*
- * Returns the allocation status of the specified sectors.
+ * Returns the allocation status of the specified offset.
  *
- * If 'sector_num' is beyond the end of the disk image the return value is 0
- * and 'pnum' is set to 0.
+ * The block layer guarantees 'offset' and 'bytes' are within bounds.
  *
- * 'pnum' is set to the number of sectors (including and immediately following
- * the specified sector) that are known to be in the same
+ * 'pnum' is set to the number of bytes (including and immediately following
+ * the specified offset) that are known to be in the same
  * allocated/unallocated state.
  *
- * 'nb_sectors' is the max value 'pnum' should be set to.  If nb_sectors goes
- * beyond the end of the disk image it will be clamped.
+ * 'bytes' is the max value 'pnum' should be set to.
  */
-static int64_t coroutine_fn raw_co_get_block_status(BlockDriverState *bs,
-                                                    int64_t sector_num,
-                                                    int nb_sectors, int *pnum,
-                                                    BlockDriverState **file)
+static int coroutine_fn raw_co_block_status(BlockDriverState *bs,
+                                            bool want_zero,
+                                            int64_t offset,
+                                            int64_t bytes, int64_t *pnum,
+                                            int64_t *map,
+                                            BlockDriverState **file)
 {
-    off_t start, data = 0, hole = 0;
-    int64_t total_size;
+    off_t data = 0, hole = 0;
     int ret;
 
     ret = fd_open(bs);
@@ -2133,39 +2157,36 @@ static int64_t coroutine_fn raw_co_get_block_status(BlockDriverState *bs,
         return ret;
     }
 
-    start = sector_num * BDRV_SECTOR_SIZE;
-    total_size = bdrv_getlength(bs);
-    if (total_size < 0) {
-        return total_size;
-    } else if (start >= total_size) {
-        *pnum = 0;
-        return 0;
-    } else if (start + nb_sectors * BDRV_SECTOR_SIZE > total_size) {
-        nb_sectors = DIV_ROUND_UP(total_size - start, BDRV_SECTOR_SIZE);
+    if (!want_zero) {
+        *pnum = bytes;
+        *map = offset;
+        *file = bs;
+        return BDRV_BLOCK_DATA | BDRV_BLOCK_OFFSET_VALID;
     }
 
-    ret = find_allocation(bs, start, &data, &hole);
+    ret = find_allocation(bs, offset, &data, &hole);
     if (ret == -ENXIO) {
         /* Trailing hole */
-        *pnum = nb_sectors;
+        *pnum = bytes;
         ret = BDRV_BLOCK_ZERO;
     } else if (ret < 0) {
         /* No info available, so pretend there are no holes */
-        *pnum = nb_sectors;
+        *pnum = bytes;
         ret = BDRV_BLOCK_DATA;
-    } else if (data == start) {
-        /* On a data extent, compute sectors to the end of the extent,
+    } else if (data == offset) {
+        /* On a data extent, compute bytes to the end of the extent,
          * possibly including a partial sector at EOF. */
-        *pnum = MIN(nb_sectors, DIV_ROUND_UP(hole - start, BDRV_SECTOR_SIZE));
+        *pnum = MIN(bytes, hole - offset);
         ret = BDRV_BLOCK_DATA;
     } else {
-        /* On a hole, compute sectors to the beginning of the next extent.  */
-        assert(hole == start);
-        *pnum = MIN(nb_sectors, (data - start) / BDRV_SECTOR_SIZE);
+        /* On a hole, compute bytes to the beginning of the next extent.  */
+        assert(hole == offset);
+        *pnum = MIN(bytes, data - offset);
         ret = BDRV_BLOCK_ZERO;
     }
+    *map = offset;
     *file = bs;
-    return ret | BDRV_BLOCK_OFFSET_VALID | start;
+    return ret | BDRV_BLOCK_OFFSET_VALID;
 }
 
 static coroutine_fn BlockAIOCB *raw_aio_pdiscard(BlockDriverState *bs,
@@ -2199,7 +2220,6 @@ static int raw_get_info(BlockDriverState *bs, BlockDriverInfo *bdi)
     BDRVRawState *s = bs->opaque;
 
     bdi->unallocated_blocks_are_zero = s->discard_zeroes;
-    bdi->can_write_zeroes_with_unmap = s->discard_zeroes;
     return 0;
 }
 
@@ -2257,9 +2277,9 @@ BlockDriver bdrv_file = {
     .bdrv_reopen_commit = raw_reopen_commit,
     .bdrv_reopen_abort = raw_reopen_abort,
     .bdrv_close = raw_close,
-    .bdrv_create = raw_create,
+    .bdrv_co_create_opts = raw_co_create_opts,
     .bdrv_has_zero_init = bdrv_has_zero_init_1,
-    .bdrv_co_get_block_status = raw_co_get_block_status,
+    .bdrv_co_block_status = raw_co_block_status,
     .bdrv_co_pwrite_zeroes = raw_co_pwrite_zeroes,
 
     .bdrv_co_preadv         = raw_co_preadv,
@@ -2597,6 +2617,15 @@ static BlockAIOCB *hdev_aio_ioctl(BlockDriverState *bs,
     if (fd_open(bs) < 0)
         return NULL;
 
+    if (req == SG_IO && s->pr_mgr) {
+        struct sg_io_hdr *io_hdr = buf;
+        if (io_hdr->cmdp[0] == PERSISTENT_RESERVE_OUT ||
+            io_hdr->cmdp[0] == PERSISTENT_RESERVE_IN) {
+            return pr_manager_execute(s->pr_mgr, bdrv_get_aio_context(bs),
+                                      s->fd, io_hdr, cb, opaque);
+        }
+    }
+
     acb = g_new(RawPosixAIOData, 1);
     acb->bs = bs;
     acb->aio_type = QEMU_AIO_IOCTL;
@@ -2652,8 +2681,8 @@ static coroutine_fn int hdev_co_pwrite_zeroes(BlockDriverState *bs,
     return -ENOTSUP;
 }
 
-static int hdev_create(const char *filename, QemuOpts *opts,
-                       Error **errp)
+static int coroutine_fn hdev_co_create_opts(const char *filename, QemuOpts *opts,
+                                            Error **errp)
 {
     int fd;
     int ret = 0;
@@ -2700,6 +2729,16 @@ static int hdev_create(const char *filename, QemuOpts *opts,
         ret = -ENOSPC;
     }
 
+    if (!ret && total_size) {
+        uint8_t buf[BDRV_SECTOR_SIZE] = { 0 };
+        int64_t zero_size = MIN(BDRV_SECTOR_SIZE, total_size);
+        if (lseek(fd, 0, SEEK_SET) == -1) {
+            ret = -errno;
+        } else {
+            ret = qemu_write_full(fd, buf, zero_size);
+            ret = ret == zero_size ? 0 : -errno;
+        }
+    }
     qemu_close(fd);
     return ret;
 }
@@ -2716,7 +2755,7 @@ static BlockDriver bdrv_host_device = {
     .bdrv_reopen_prepare = raw_reopen_prepare,
     .bdrv_reopen_commit  = raw_reopen_commit,
     .bdrv_reopen_abort   = raw_reopen_abort,
-    .bdrv_create         = hdev_create,
+    .bdrv_co_create_opts = hdev_co_create_opts,
     .create_opts         = &raw_create_opts,
     .bdrv_co_pwrite_zeroes = hdev_co_pwrite_zeroes,
 
@@ -2838,7 +2877,7 @@ static BlockDriver bdrv_host_cdrom = {
     .bdrv_reopen_prepare = raw_reopen_prepare,
     .bdrv_reopen_commit  = raw_reopen_commit,
     .bdrv_reopen_abort   = raw_reopen_abort,
-    .bdrv_create         = hdev_create,
+    .bdrv_co_create_opts = hdev_co_create_opts,
     .create_opts         = &raw_create_opts,
 
 
@@ -2969,7 +3008,7 @@ static BlockDriver bdrv_host_cdrom = {
     .bdrv_reopen_prepare = raw_reopen_prepare,
     .bdrv_reopen_commit  = raw_reopen_commit,
     .bdrv_reopen_abort   = raw_reopen_abort,
-    .bdrv_create        = hdev_create,
+    .bdrv_co_create_opts = hdev_co_create_opts,
     .create_opts        = &raw_create_opts,
 
     .bdrv_co_preadv         = raw_co_preadv,

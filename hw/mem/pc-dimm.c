@@ -109,7 +109,6 @@ void pc_dimm_memory_plug(DeviceState *dev, MemoryHotplugState *hpms,
 
     memory_region_add_subregion(&hpms->mr, addr - hpms->base, mr);
     vmstate_register_ram(vmstate_mr, dev);
-    numa_set_mem_node_id(addr, memory_region_size(mr), dimm->node);
 
 out:
     error_propagate(errp, local_err);
@@ -122,7 +121,6 @@ void pc_dimm_memory_unplug(DeviceState *dev, MemoryHotplugState *hpms,
     PCDIMMDeviceClass *ddc = PC_DIMM_GET_CLASS(dimm);
     MemoryRegion *vmstate_mr = ddc->get_vmstate_memory_region(dimm);
 
-    numa_unset_mem_node_id(dimm->addr, memory_region_size(mr), dimm->node);
     memory_region_del_subregion(&hpms->mr, mr);
     vmstate_unregister_ram(vmstate_mr, dev);
 }
@@ -157,6 +155,11 @@ uint64_t pc_existing_dimms_capacity(Error **errp)
 
     pc_existing_dimms_capacity_internal(qdev_get_machine(), &cap);
     return cap.size;
+}
+
+uint64_t get_plugged_memory_size(void)
+{
+    return pc_existing_dimms_capacity(&error_abort);
 }
 
 int qmp_pc_dimm_device_list(Object *obj, void *opaque)

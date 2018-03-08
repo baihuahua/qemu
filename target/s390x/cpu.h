@@ -25,6 +25,7 @@
 
 #include "qemu-common.h"
 #include "cpu-qom.h"
+#include "cpu_models.h"
 
 #define TARGET_LONG_BITS 64
 
@@ -40,47 +41,24 @@
 
 #include "exec/cpu-all.h"
 
-#include "fpu/softfloat.h"
-
-#define NB_MMU_MODES 3
+#define NB_MMU_MODES 4
 #define TARGET_INSN_START_EXTRA_WORDS 1
 
 #define MMU_MODE0_SUFFIX _primary
 #define MMU_MODE1_SUFFIX _secondary
 #define MMU_MODE2_SUFFIX _home
+#define MMU_MODE3_SUFFIX _real
 
 #define MMU_USER_IDX 0
 
-#define MAX_EXT_QUEUE 16
-#define MAX_IO_QUEUE 16
-#define MAX_MCHK_QUEUE 16
-
-#define PSW_MCHK_MASK 0x0004000000000000
-#define PSW_IO_MASK 0x0200000000000000
+#define S390_MAX_CPUS 248
 
 typedef struct PSW {
     uint64_t mask;
     uint64_t addr;
 } PSW;
 
-typedef struct ExtQueue {
-    uint32_t code;
-    uint32_t param;
-    uint32_t param64;
-} ExtQueue;
-
-typedef struct IOIntQueue {
-    uint16_t id;
-    uint16_t nr;
-    uint32_t parm;
-    uint32_t word;
-} IOIntQueue;
-
-typedef struct MchkQueue {
-    uint16_t type;
-} MchkQueue;
-
-typedef struct CPUS390XState {
+struct CPUS390XState {
     uint64_t regs[16];     /* GP registers */
     /*
      * The floating point registers are part of the vector registers.
@@ -96,6 +74,7 @@ typedef struct CPUS390XState {
 
     uint32_t fpc;          /* floating-point control register */
     uint32_t cc_op;
+    bool bpbc;             /* branch prediction blocking */
 
     float_status fpu_status; /* passed to softfloat lib */
 
@@ -103,6 +82,8 @@ typedef struct CPUS390XState {
     uint64_t retxl;
 
     PSW psw;
+
+    S390CrashReason crash_reason;
 
     uint64_t cc_src;
     uint64_t cc_dst;
@@ -124,14 +105,9 @@ typedef struct CPUS390XState {
 
     uint64_t cregs[16]; /* control registers */
 
-    ExtQueue ext_queue[MAX_EXT_QUEUE];
-    IOIntQueue io_queue[MAX_IO_QUEUE][8];
-    MchkQueue mchk_queue[MAX_MCHK_QUEUE];
-
     int pending_int;
-    int ext_index;
-    int io_index[8];
-    int mchk_index;
+    uint16_t external_call_addr;
+    DECLARE_BITMAP(emergency_signals, S390_MAX_CPUS);
 
     uint64_t ckc;
     uint64_t cputm;
@@ -149,8 +125,10 @@ typedef struct CPUS390XState {
 
     CPU_COMMON
 
-    uint32_t cpu_num;
+#if !defined(CONFIG_USER_ONLY)
+    uint32_t core_id; /* PoP "CPU address", same as cpu_index */
     uint64_t cpuid;
+#endif
 
     uint64_t tod_offset;
     uint64_t tod_basetime;
@@ -163,18 +141,15 @@ typedef struct CPUS390XState {
      * architectures, there is a difference between a halt and a stop on s390.
      * If all cpus are either stopped (including check stop) or in the disabled
      * wait state, the vm can be shut down.
+     * The acceptable cpu_state values are defined in the CpuInfoS390State
+     * enum.
      */
-#define CPU_STATE_UNINITIALIZED        0x00
-#define CPU_STATE_STOPPED              0x01
-#define CPU_STATE_CHECK_STOP           0x02
-#define CPU_STATE_OPERATING            0x03
-#define CPU_STATE_LOAD                 0x04
     uint8_t cpu_state;
 
     /* currently processed sigp order */
     uint8_t sigp_order;
 
-} CPUS390XState;
+};
 
 static inline CPU_DoubleU *get_freg(CPUS390XState *cs, int nr)
 {
@@ -193,7 +168,6 @@ struct S390CPU {
     /*< public >*/
 
     CPUS390XState env;
-    int64_t id;
     S390CPUModel *model;
     /* needed for live migration */
     void *irqstate;
@@ -292,6 +266,7 @@ extern const struct VMStateDescription vmstate_s390_cpu;
 #undef PSW_SHIFT_ASC
 #undef PSW_MASK_CC
 #undef PSW_MASK_PM
+#undef PSW_SHIFT_MASK_PM
 #undef PSW_MASK_64
 #undef PSW_MASK_32
 #undef PSW_MASK_ESA_ADDR
@@ -309,6 +284,7 @@ extern const struct VMStateDescription vmstate_s390_cpu;
 #define PSW_SHIFT_ASC           46
 #define PSW_MASK_CC             0x0000300000000000ULL
 #define PSW_MASK_PM             0x00000F0000000000ULL
+#define PSW_SHIFT_MASK_PM       40
 #define PSW_MASK_64             0x0000000100000000ULL
 #define PSW_MASK_32             0x0000000080000000ULL
 #define PSW_MASK_ESA_ADDR       0x000000007fffffffULL
@@ -333,25 +309,39 @@ extern const struct VMStateDescription vmstate_s390_cpu;
 
 #define FLAG_MASK_PSW_SHIFT     31
 #define FLAG_MASK_PER           (PSW_MASK_PER    >> FLAG_MASK_PSW_SHIFT)
+#define FLAG_MASK_DAT           (PSW_MASK_DAT    >> FLAG_MASK_PSW_SHIFT)
 #define FLAG_MASK_PSTATE        (PSW_MASK_PSTATE >> FLAG_MASK_PSW_SHIFT)
 #define FLAG_MASK_ASC           (PSW_MASK_ASC    >> FLAG_MASK_PSW_SHIFT)
 #define FLAG_MASK_64            (PSW_MASK_64     >> FLAG_MASK_PSW_SHIFT)
 #define FLAG_MASK_32            (PSW_MASK_32     >> FLAG_MASK_PSW_SHIFT)
-#define FLAG_MASK_PSW		(FLAG_MASK_PER | FLAG_MASK_PSTATE \
+#define FLAG_MASK_PSW           (FLAG_MASK_PER | FLAG_MASK_DAT | FLAG_MASK_PSTATE \
                                 | FLAG_MASK_ASC | FLAG_MASK_64 | FLAG_MASK_32)
 
 /* Control register 0 bits */
 #define CR0_LOWPROT             0x0000000010000000ULL
 #define CR0_SECONDARY           0x0000000004000000ULL
 #define CR0_EDAT                0x0000000000800000ULL
+#define CR0_EMERGENCY_SIGNAL_SC 0x0000000000004000ULL
+#define CR0_EXTERNAL_CALL_SC    0x0000000000002000ULL
+#define CR0_CKC_SC              0x0000000000000800ULL
+#define CR0_CPU_TIMER_SC        0x0000000000000400ULL
+#define CR0_SERVICE_SC          0x0000000000000200ULL
+
+/* Control register 14 bits */
+#define CR14_CHANNEL_REPORT_SC  0x0000000010000000ULL
 
 /* MMU */
 #define MMU_PRIMARY_IDX         0
 #define MMU_SECONDARY_IDX       1
 #define MMU_HOME_IDX            2
+#define MMU_REAL_IDX            3
 
 static inline int cpu_mmu_index(CPUS390XState *env, bool ifetch)
 {
+    if (!(env->psw.mask & PSW_MASK_DAT)) {
+        return MMU_REAL_IDX;
+    }
+
     switch (env->psw.mask & PSW_MASK_ASC) {
     case PSW_ASC_PRIMARY:
         return MMU_PRIMARY_IDX;
@@ -393,14 +383,17 @@ static inline void cpu_get_tb_cpu_state(CPUS390XState* env, target_ulong *pc,
 #define EXCP_EXT 1 /* external interrupt */
 #define EXCP_SVC 2 /* supervisor call (syscall) */
 #define EXCP_PGM 3 /* program interruption */
+#define EXCP_RESTART 4 /* restart interrupt */
+#define EXCP_STOP 5 /* stop interrupt */
 #define EXCP_IO  7 /* I/O interrupt */
 #define EXCP_MCHK 8 /* machine check */
 
-#define INTERRUPT_EXT        (1 << 0)
-#define INTERRUPT_TOD        (1 << 1)
-#define INTERRUPT_CPUTIMER   (1 << 2)
-#define INTERRUPT_IO         (1 << 3)
-#define INTERRUPT_MCHK       (1 << 4)
+#define INTERRUPT_EXT_CPU_TIMER          (1 << 3)
+#define INTERRUPT_EXT_CLOCK_COMPARATOR   (1 << 4)
+#define INTERRUPT_EXTERNAL_CALL          (1 << 5)
+#define INTERRUPT_EMERGENCY_SIGNAL       (1 << 6)
+#define INTERRUPT_RESTART                (1 << 7)
+#define INTERRUPT_STOP                   (1 << 8)
 
 /* Program Status Word.  */
 #define S390_PSWM_REGNUM 0
@@ -435,62 +428,66 @@ static inline void setcc(S390CPU *cpu, uint64_t cc)
 }
 
 /* STSI */
-#define STSI_LEVEL_MASK         0x00000000f0000000ULL
-#define STSI_LEVEL_CURRENT      0x0000000000000000ULL
-#define STSI_LEVEL_1            0x0000000010000000ULL
-#define STSI_LEVEL_2            0x0000000020000000ULL
-#define STSI_LEVEL_3            0x0000000030000000ULL
+#define STSI_R0_FC_MASK         0x00000000f0000000ULL
+#define STSI_R0_FC_CURRENT      0x0000000000000000ULL
+#define STSI_R0_FC_LEVEL_1      0x0000000010000000ULL
+#define STSI_R0_FC_LEVEL_2      0x0000000020000000ULL
+#define STSI_R0_FC_LEVEL_3      0x0000000030000000ULL
 #define STSI_R0_RESERVED_MASK   0x000000000fffff00ULL
 #define STSI_R0_SEL1_MASK       0x00000000000000ffULL
 #define STSI_R1_RESERVED_MASK   0x00000000ffff0000ULL
 #define STSI_R1_SEL2_MASK       0x000000000000ffffULL
 
 /* Basic Machine Configuration */
-struct sysib_111 {
-    uint32_t res1[8];
+typedef struct SysIB_111 {
+    uint8_t  res1[32];
     uint8_t  manuf[16];
     uint8_t  type[4];
     uint8_t  res2[12];
     uint8_t  model[16];
     uint8_t  sequence[16];
     uint8_t  plant[4];
-    uint8_t  res3[156];
-};
+    uint8_t  res3[3996];
+} SysIB_111;
+QEMU_BUILD_BUG_ON(sizeof(SysIB_111) != 4096);
 
 /* Basic Machine CPU */
-struct sysib_121 {
-    uint32_t res1[80];
+typedef struct SysIB_121 {
+    uint8_t  res1[80];
     uint8_t  sequence[16];
     uint8_t  plant[4];
     uint8_t  res2[2];
     uint16_t cpu_addr;
-    uint8_t  res3[152];
-};
+    uint8_t  res3[3992];
+} SysIB_121;
+QEMU_BUILD_BUG_ON(sizeof(SysIB_121) != 4096);
 
 /* Basic Machine CPUs */
-struct sysib_122 {
+typedef struct SysIB_122 {
     uint8_t res1[32];
     uint32_t capability;
     uint16_t total_cpus;
-    uint16_t active_cpus;
+    uint16_t conf_cpus;
     uint16_t standby_cpus;
     uint16_t reserved_cpus;
     uint16_t adjustments[2026];
-};
+} SysIB_122;
+QEMU_BUILD_BUG_ON(sizeof(SysIB_122) != 4096);
 
 /* LPAR CPU */
-struct sysib_221 {
-    uint32_t res1[80];
+typedef struct SysIB_221 {
+    uint8_t  res1[80];
     uint8_t  sequence[16];
     uint8_t  plant[4];
     uint16_t cpu_id;
     uint16_t cpu_addr;
-    uint8_t  res3[152];
-};
+    uint8_t  res3[3992];
+} SysIB_221;
+QEMU_BUILD_BUG_ON(sizeof(SysIB_221) != 4096);
 
 /* LPAR CPUs */
-struct sysib_222 {
-    uint32_t res1[32];
+typedef struct SysIB_222 {
+    uint8_t  res1[32];
     uint16_t lpar_num;
     uint8_t  res2;
     uint8_t  lcpuc;
@@ -503,11 +500,12 @@ struct sysib_222 {
     uint8_t  res3[16];
     uint16_t dedicated_cpus;
     uint16_t shared_cpus;
-    uint8_t  res4[180];
-};
+    uint8_t  res4[4020];
+} SysIB_222;
+QEMU_BUILD_BUG_ON(sizeof(SysIB_222) != 4096);
 
 /* VM CPUs */
-struct sysib_322 {
+typedef struct SysIB_322 {
     uint8_t  res1[31];
     uint8_t  count;
     struct {
@@ -526,7 +524,18 @@ struct sysib_322 {
     } vm[8];
     uint8_t res4[1504];
     uint8_t ext_names[8][256];
-};
+} SysIB_322;
+QEMU_BUILD_BUG_ON(sizeof(SysIB_322) != 4096);
+
+typedef union SysIB {
+    SysIB_111 sysib_111;
+    SysIB_121 sysib_121;
+    SysIB_122 sysib_122;
+    SysIB_221 sysib_221;
+    SysIB_222 sysib_222;
+    SysIB_322 sysib_322;
+} SysIB;
+QEMU_BUILD_BUG_ON(sizeof(SysIB) != 4096);
 
 /* MMU defines */
 #define _ASCE_ORIGIN            ~0xfffULL /* segment table origin             */
@@ -581,6 +590,8 @@ struct sysib_322 {
 #define SIGP_SET_PREFIX        0x0d
 #define SIGP_STORE_STATUS_ADDR 0x0e
 #define SIGP_SET_ARCH          0x12
+#define SIGP_COND_EMERGENCY    0x13
+#define SIGP_SENSE_RUNNING     0x15
 #define SIGP_STORE_ADTL_STATUS 0x17
 
 /* SIGP condition codes */
@@ -591,6 +602,7 @@ struct sysib_322 {
 
 /* SIGP status bits */
 #define SIGP_STAT_EQUIPMENT_CHECK   0x80000000UL
+#define SIGP_STAT_NOT_RUNNING       0x00000400UL
 #define SIGP_STAT_INCORRECT_STATE   0x00000200UL
 #define SIGP_STAT_INVALID_PARAMETER 0x00000100UL
 #define SIGP_STAT_EXT_CALL_PENDING  0x00000080UL
@@ -608,10 +620,6 @@ struct sysib_322 {
 
 /* SIGP order code mask corresponding to bit positions 56-63 */
 #define SIGP_ORDER_MASK 0x000000ff
-
-/* from s390-virtio-ccw */
-#define MEM_SECTION_SIZE             0x10000000UL
-#define MAX_AVAIL_SLOTS              32
 
 /* machine check interruption code */
 
@@ -658,16 +666,34 @@ struct sysib_322 {
 #define MCIC_VB_CT 0x0000000000020000ULL
 #define MCIC_VB_CC 0x0000000000010000ULL
 
+static inline uint64_t s390_build_validity_mcic(void)
+{
+    uint64_t mcic;
+
+    /*
+     * Indicate all validity bits (no damage) only. Other bits have to be
+     * added by the caller. (storage errors, subclasses and subclass modifiers)
+     */
+    mcic = MCIC_VB_WP | MCIC_VB_MS | MCIC_VB_PM | MCIC_VB_IA | MCIC_VB_FP |
+           MCIC_VB_GR | MCIC_VB_CR | MCIC_VB_ST | MCIC_VB_AR | MCIC_VB_PR |
+           MCIC_VB_FC | MCIC_VB_CT | MCIC_VB_CC;
+    if (s390_has_feat(S390_FEAT_VECTOR)) {
+        mcic |= MCIC_VB_VR;
+    }
+    if (s390_has_feat(S390_FEAT_GUARDED_STORAGE)) {
+        mcic |= MCIC_VB_GS;
+    }
+    return mcic;
+}
+
 
 /* cpu.c */
 int s390_get_clock(uint8_t *tod_high, uint64_t *tod_low);
 int s390_set_clock(uint8_t *tod_high, uint64_t *tod_low);
 void s390_crypto_reset(void);
 bool s390_get_squash_mcss(void);
-int s390_get_memslot_count(void);
 int s390_set_memory_limit(uint64_t new_limit, uint64_t *hw_limit);
 void s390_cmma_reset(void);
-int s390_cpu_restart(S390CPU *cpu);
 void s390_enable_css_support(S390CPU *cpu);
 int s390_assign_subch_ioeventfd(EventNotifier *notifier, uint32_t sch_id,
                                 int vq, bool assign);
@@ -679,17 +705,25 @@ static inline unsigned int s390_cpu_set_state(uint8_t cpu_state, S390CPU *cpu)
     return 0;
 }
 #endif /* CONFIG_USER_ONLY */
+static inline uint8_t s390_cpu_get_state(S390CPU *cpu)
+{
+    return cpu->env.cpu_state;
+}
 
 
 /* cpu_models.c */
 void s390_cpu_list(FILE *f, fprintf_function cpu_fprintf);
 #define cpu_list s390_cpu_list
-const char *s390_default_cpu_model_name(void);
+void s390_set_qemu_cpu_model(uint16_t type, uint8_t gen, uint8_t ec_ga,
+                             const S390FeatInit feat_init);
 
 
 /* helper.c */
 #define cpu_init(cpu_model) cpu_generic_init(TYPE_S390_CPU, cpu_model)
-S390CPU *s390x_new_cpu(const char *cpu_model, int64_t id, Error **errp);
+
+#define S390_CPU_TYPE_SUFFIX "-" TYPE_S390_CPU
+#define S390_CPU_TYPE_NAME(name) (name S390_CPU_TYPE_SUFFIX)
+
 /* you can call this signal handler from your SIGBUS and SIGSEGV
    signal handlers to inform the virtual CPU of exceptions. non zero
    is returned if the signal was handled by the virtual CPU.  */
@@ -703,10 +737,11 @@ void s390_io_interrupt(uint16_t subchannel_id, uint16_t subchannel_nr,
                        uint32_t io_int_parm, uint32_t io_int_word);
 /* automatically detect the instruction length */
 #define ILEN_AUTO                   0xff
-void program_interrupt(CPUS390XState *env, uint32_t code, int ilen);
+#define RA_IGNORED                  0
+void s390_program_interrupt(CPUS390XState *env, uint32_t code, int ilen,
+                            uintptr_t ra);
 /* service interrupts are floating therefore we must not pass an cpustate */
 void s390_sclp_extint(uint32_t parm);
-
 
 /* mmu_helper.c */
 int s390_cpu_virt_mem_rw(S390CPU *cpu, vaddr laddr, uint8_t ar, void *hostbuf,
@@ -715,14 +750,19 @@ int s390_cpu_virt_mem_rw(S390CPU *cpu, vaddr laddr, uint8_t ar, void *hostbuf,
         s390_cpu_virt_mem_rw(cpu, laddr, ar, dest, len, false)
 #define s390_cpu_virt_mem_write(cpu, laddr, ar, dest, len)       \
         s390_cpu_virt_mem_rw(cpu, laddr, ar, dest, len, true)
+#define s390_cpu_virt_mem_check_read(cpu, laddr, ar, len)   \
+        s390_cpu_virt_mem_rw(cpu, laddr, ar, NULL, len, false)
 #define s390_cpu_virt_mem_check_write(cpu, laddr, ar, len)   \
         s390_cpu_virt_mem_rw(cpu, laddr, ar, NULL, len, true)
+void s390_cpu_virt_mem_handle_exc(S390CPU *cpu, uintptr_t ra);
+
+
+/* sigp.c */
+int s390_cpu_restart(S390CPU *cpu);
+void s390_init_sigp(void);
 
 
 /* outside of target/s390x/ */
 S390CPU *s390_cpu_addr2state(uint16_t cpu_addr);
-extern void subsystem_reset(void);
-int sclp_service_call(CPUS390XState *env, uint64_t sccb, uint32_t code);
-int s390_virtio_hypercall(CPUS390XState *env);
 
 #endif

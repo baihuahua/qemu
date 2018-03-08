@@ -5,7 +5,7 @@
  *
  * Authors:
  *  Michael S. Tsirkin <mst@redhat.com>
- *  Victor Kaplansky <victork@redhat.com>    
+ *  Victor Kaplansky <victork@redhat.com>
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
@@ -130,24 +130,24 @@ int boot_sector_init(char *fname)
 }
 
 /* Loop until signature in memory is OK.  */
-void boot_sector_test(void)
+void boot_sector_test(QTestState *qts)
 {
     uint8_t signature_low;
     uint8_t signature_high;
     uint16_t signature;
     int i;
 
-    /* Wait at most 90 seconds */
+    /* Wait at most 600 seconds (test is slow with TCI and --enable-debug) */
 #define TEST_DELAY (1 * G_USEC_PER_SEC / 10)
-#define TEST_CYCLES MAX((90 * G_USEC_PER_SEC / TEST_DELAY), 1)
+#define TEST_CYCLES MAX((600 * G_USEC_PER_SEC / TEST_DELAY), 1)
 
     /* Poll until code has run and modified memory.  Once it has we know BIOS
      * initialization is done.  TODO: check that IP reached the halt
      * instruction.
      */
     for (i = 0; i < TEST_CYCLES; ++i) {
-        signature_low = readb(SIGNATURE_ADDR);
-        signature_high = readb(SIGNATURE_ADDR + 1);
+        signature_low = qtest_readb(qts, SIGNATURE_ADDR);
+        signature_high = qtest_readb(qts, SIGNATURE_ADDR + 1);
         signature = (signature_high << 8) | signature_low;
         if (signature == SIGNATURE) {
             break;

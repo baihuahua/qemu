@@ -24,7 +24,6 @@
  */
 #include "qemu/osdep.h"
 #include "hw/hw.h"
-#include "hw/i386/pc.h"
 #include "hw/pci/pci.h"
 #include "hw/isa/isa.h"
 #include "sysemu/block-backend.h"
@@ -32,6 +31,7 @@
 #include "sysemu/dma.h"
 
 #include "hw/ide/pci.h"
+#include "trace.h"
 
 /* CMD646 specific */
 #define CFR		0x50
@@ -195,9 +195,8 @@ static uint64_t bmdma_read(void *opaque, hwaddr addr,
         val = 0xff;
         break;
     }
-#ifdef DEBUG_IDE
-    printf("bmdma: readb " TARGET_FMT_plx " : 0x%02x\n", addr, val);
-#endif
+
+    trace_bmdma_read_cmd646(addr, val);
     return val;
 }
 
@@ -211,9 +210,7 @@ static void bmdma_write(void *opaque, hwaddr addr,
         return;
     }
 
-#ifdef DEBUG_IDE
-    printf("bmdma: writeb " TARGET_FMT_plx " : 0x%" PRIx64 "\n", addr, val);
-#endif
+    trace_bmdma_write_cmd646(addr, val);
     switch(addr & 3) {
     case 0:
         bmdma_cmd_writeb(bm, val);

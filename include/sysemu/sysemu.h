@@ -2,10 +2,9 @@
 #define SYSEMU_H
 /* Misc. things related to the system emulator.  */
 
-#include "qemu/option.h"
+#include "qapi/qapi-types-run-state.h"
 #include "qemu/queue.h"
 #include "qemu/timer.h"
-#include "qapi-types.h"
 #include "qemu/notify.h"
 #include "qemu/main-loop.h"
 #include "qemu/bitmap.h"
@@ -112,8 +111,9 @@ extern const char *keyboard_layout;
 extern int win2k_install_hack;
 extern int alt_grab;
 extern int ctrl_grab;
+extern int no_frame;
 extern int smp_cpus;
-extern int max_cpus;
+extern unsigned int max_cpus;
 extern int cursor_hide;
 extern int graphic_rotate;
 extern int no_quit;
@@ -166,8 +166,6 @@ extern Chardev *serial_hds[MAX_SERIAL_PORTS];
 
 extern Chardev *parallel_hds[MAX_PARALLEL_PORTS];
 
-void hmp_usb_add(Monitor *mon, const QDict *qdict);
-void hmp_usb_del(Monitor *mon, const QDict *qdict);
 void hmp_info_usb(Monitor *mon, const QDict *qdict);
 
 void add_boot_device_path(int32_t bootindex, DeviceState *dev,
@@ -200,6 +198,7 @@ extern QemuOptsList bdrv_runtime_opts;
 extern QemuOptsList qemu_chardev_opts;
 extern QemuOptsList qemu_device_opts;
 extern QemuOptsList qemu_netdev_opts;
+extern QemuOptsList qemu_nic_opts;
 extern QemuOptsList qemu_net_opts;
 extern QemuOptsList qemu_global_opts;
 extern QemuOptsList qemu_mon_opts;

@@ -12,19 +12,23 @@
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
- *
  */
+
 #include "qemu/osdep.h"
-#include "libqtest.h"
 
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/un.h>
 
+#include "libqtest.h"
+#include "qemu/cutils.h"
 #include "qapi/error.h"
 #include "qapi/qmp/json-parser.h"
 #include "qapi/qmp/json-streamer.h"
+#include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qjson.h"
+#include "qapi/qmp/qlist.h"
+#include "qapi/qmp/qstring.h"
 
 #define MAX_IRQ 256
 #define SOCKET_TIMEOUT 50
@@ -42,7 +46,6 @@ struct QTestState
 };
 
 static GHookList abrt_hooks;
-static GList *qtest_instances;
 static struct sigaction sigact_old;
 
 #define g_assert_no_errno(ret) do { \
@@ -150,6 +153,19 @@ void qtest_add_abrt_handler(GHookFunc fn, const void *data)
     g_hook_prepend(&abrt_hooks, hook);
 }
 
+static const char *qtest_qemu_binary(void)
+{
+    const char *qemu_bin;
+
+    qemu_bin = getenv("QTEST_QEMU_BINARY");
+    if (!qemu_bin) {
+        fprintf(stderr, "Environment variable QTEST_QEMU_BINARY required\n");
+        exit(1);
+    }
+
+    return qemu_bin;
+}
+
 QTestState *qtest_init_without_qmp_handshake(const char *extra_args)
 {
     QTestState *s;
@@ -157,15 +173,9 @@ QTestState *qtest_init_without_qmp_handshake(const char *extra_args)
     gchar *socket_path;
     gchar *qmp_socket_path;
     gchar *command;
-    const char *qemu_binary;
+    const char *qemu_binary = qtest_qemu_binary();
 
-    qemu_binary = getenv("QTEST_QEMU_BINARY");
-    if (!qemu_binary) {
-        fprintf(stderr, "Environment variable QTEST_QEMU_BINARY required\n");
-        exit(1);
-    }
-
-    s = g_malloc(sizeof(*s));
+    s = g_new(QTestState, 1);
 
     socket_path = g_strdup_printf("/tmp/qtest-%d.sock", getpid());
     qmp_socket_path = g_strdup_printf("/tmp/qtest-%d.qmp", getpid());
@@ -238,15 +248,34 @@ QTestState *qtest_init(const char *extra_args)
     return s;
 }
 
+QTestState *qtest_vstartf(const char *fmt, va_list ap)
+{
+    char *args = g_strdup_vprintf(fmt, ap);
+    QTestState *s;
+
+    s = qtest_start(args);
+    g_free(args);
+    global_qtest = NULL;
+    return s;
+}
+
+QTestState *qtest_startf(const char *fmt, ...)
+{
+    va_list ap;
+    QTestState *s;
+
+    va_start(ap, fmt);
+    s = qtest_vstartf(fmt, ap);
+    va_end(ap);
+    return s;
+}
+
 void qtest_quit(QTestState *s)
 {
-    qtest_instances = g_list_remove(qtest_instances, s);
     g_hook_destroy_link(&abrt_hooks, g_hook_find_data(&abrt_hooks, TRUE, s));
 
     /* Uninstall SIGABRT handler on last instance */
-    if (!qtest_instances) {
-        cleanup_sigabrt_handler();
-    }
+    cleanup_sigabrt_handler();
 
     kill_qemu(s);
     close(s->fd);
@@ -335,12 +364,14 @@ redo:
     g_string_free(line, TRUE);
 
     if (strcmp(words[0], "IRQ") == 0) {
-        int irq;
+        long irq;
+        int ret;
 
         g_assert(words[1] != NULL);
         g_assert(words[2] != NULL);
 
-        irq = strtoul(words[2], NULL, 0);
+        ret = qemu_strtol(words[2], NULL, 0, &irq);
+        g_assert(!ret);
         g_assert_cmpint(irq, >=, 0);
         g_assert_cmpint(irq, <, MAX_IRQ);
 
@@ -624,8 +655,7 @@ char *qtest_hmp(QTestState *s, const char *fmt, ...)
 
 const char *qtest_get_arch(void)
 {
-    const char *qemu = getenv("QTEST_QEMU_BINARY");
-    g_assert(qemu != NULL);
+    const char *qemu = qtest_qemu_binary();
     const char *end = strrchr(qemu, '/');
 
     return end + strlen("/qemu-system-");
@@ -703,11 +733,13 @@ void qtest_outl(QTestState *s, uint16_t addr, uint32_t value)
 static uint32_t qtest_in(QTestState *s, const char *cmd, uint16_t addr)
 {
     gchar **args;
-    uint32_t value;
+    int ret;
+    unsigned long value;
 
     qtest_sendf(s, "%s 0x%x\n", cmd, addr);
     args = qtest_rsp(s, 2);
-    value = strtoul(args[1], NULL, 0);
+    ret = qemu_strtoul(args[1], NULL, 0, &value);
+    g_assert(!ret && value <= UINT32_MAX);
     g_strfreev(args);
 
     return value;
@@ -758,11 +790,13 @@ void qtest_writeq(QTestState *s, uint64_t addr, uint64_t value)
 static uint64_t qtest_read(QTestState *s, const char *cmd, uint64_t addr)
 {
     gchar **args;
+    int ret;
     uint64_t value;
 
     qtest_sendf(s, "%s 0x%" PRIx64 "\n", cmd, addr);
     args = qtest_rsp(s, 2);
-    value = strtoull(args[1], NULL, 0);
+    ret = qemu_strtou64(args[1], NULL, 0, &value);
+    g_assert(!ret);
     g_strfreev(args);
 
     return value;
@@ -986,4 +1020,79 @@ void qtest_cb_for_every_machine(void (*cb)(const char *machine))
 
     qtest_end();
     QDECREF(response);
+}
+
+/*
+ * Generic hot-plugging test via the device_add QMP command.
+ */
+void qtest_qmp_device_add(const char *driver, const char *id, const char *fmt,
+                          ...)
+{
+    QDict *response;
+    char *cmd, *opts = NULL;
+    va_list va;
+
+    if (fmt) {
+        va_start(va, fmt);
+        opts = g_strdup_vprintf(fmt, va);
+        va_end(va);
+    }
+
+    cmd = g_strdup_printf("{'execute': 'device_add',"
+                          " 'arguments': { 'driver': '%s', 'id': '%s'%s%s }}",
+                          driver, id, opts ? ", " : "", opts ? opts : "");
+    g_free(opts);
+
+    response = qmp(cmd);
+    g_free(cmd);
+    g_assert(response);
+    g_assert(!qdict_haskey(response, "event")); /* We don't expect any events */
+    g_assert(!qdict_haskey(response, "error"));
+    QDECREF(response);
+}
+
+/*
+ * Generic hot-unplugging test via the device_del QMP command.
+ * Device deletion will get one response and one event. For example:
+ *
+ * {'execute': 'device_del','arguments': { 'id': 'scsi-hd'}}
+ *
+ * will get this one:
+ *
+ * {"timestamp": {"seconds": 1505289667, "microseconds": 569862},
+ *  "event": "DEVICE_DELETED", "data": {"device": "scsi-hd",
+ *  "path": "/machine/peripheral/scsi-hd"}}
+ *
+ * and this one:
+ *
+ * {"return": {}}
+ *
+ * But the order of arrival may vary - so we've got to detect both.
+ */
+void qtest_qmp_device_del(const char *id)
+{
+    QDict *response1, *response2, *event = NULL;
+    char *cmd;
+
+    cmd = g_strdup_printf("{'execute': 'device_del',"
+                          " 'arguments': { 'id': '%s' }}", id);
+    response1 = qmp(cmd);
+    g_free(cmd);
+    g_assert(response1);
+    g_assert(!qdict_haskey(response1, "error"));
+
+    response2 = qmp("");
+    g_assert(response2);
+    g_assert(!qdict_haskey(response2, "error"));
+
+    if (qdict_haskey(response1, "event")) {
+        event = response1;
+    } else if (qdict_haskey(response2, "event")) {
+        event = response2;
+    }
+    g_assert(event);
+    g_assert_cmpstr(qdict_get_str(event, "event"), ==, "DEVICE_DELETED");
+
+    QDECREF(response1);
+    QDECREF(response2);
 }

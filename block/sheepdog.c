@@ -13,12 +13,13 @@
  */
 
 #include "qemu/osdep.h"
-#include "qapi-visit.h"
 #include "qapi/error.h"
+#include "qapi/qapi-visit-sockets.h"
 #include "qapi/qmp/qdict.h"
 #include "qapi/qobject-input-visitor.h"
 #include "qemu/uri.h"
 #include "qemu/error-report.h"
+#include "qemu/option.h"
 #include "qemu/sockets.h"
 #include "block/block_int.h"
 #include "sysemu/block-backend.h"
@@ -400,7 +401,7 @@ typedef struct BDRVSheepdogReopenState {
     int cache_flags;
 } BDRVSheepdogReopenState;
 
-static const char * sd_strerror(int err)
+static const char *sd_strerror(int err)
 {
     int i;
 
@@ -591,7 +592,7 @@ static int connect_to_sdog(BDRVSheepdogState *s, Error **errp)
 {
     int fd;
 
-    fd = socket_connect(s->addr, NULL, NULL, errp);
+    fd = socket_connect(s->addr, errp);
 
     if (s->addr->type == SOCKET_ADDRESS_TYPE_INET && fd >= 0) {
         int ret = socket_set_nodelay(fd);
@@ -776,8 +777,7 @@ static coroutine_fn void reconnect_to_sdog(void *opaque)
         if (s->fd < 0) {
             DPRINTF("Wait for connection to be established\n");
             error_report_err(local_err);
-            co_aio_sleep_ns(bdrv_get_aio_context(s->bs), QEMU_CLOCK_REALTIME,
-                            1000000000ULL);
+            qemu_co_sleep_ns(QEMU_CLOCK_REALTIME, 1000000000ULL);
         }
     };
 
@@ -1632,7 +1632,7 @@ static int sd_open(BlockDriverState *bs, QDict *options, int flags,
     if (!tag) {
         tag = "";
     }
-    if (tag && strlen(tag) >= SD_MAX_VDI_TAG_LEN) {
+    if (strlen(tag) >= SD_MAX_VDI_TAG_LEN) {
         error_setg(errp, "value of parameter 'tag' is too long");
         ret = -EINVAL;
         goto err_no_fd;
@@ -1826,40 +1826,34 @@ static int do_sd_create(BDRVSheepdogState *s, uint32_t *vdi_id, int snapshot,
     return 0;
 }
 
-static int sd_prealloc(const char *filename, Error **errp)
+static int sd_prealloc(BlockDriverState *bs, int64_t old_size, int64_t new_size,
+                       Error **errp)
 {
     BlockBackend *blk = NULL;
-    BDRVSheepdogState *base = NULL;
+    BDRVSheepdogState *base = bs->opaque;
     unsigned long buf_size;
     uint32_t idx, max_idx;
     uint32_t object_size;
-    int64_t vdi_size;
     void *buf = NULL;
     int ret;
 
-    blk = blk_new_open(filename, NULL, NULL,
-                       BDRV_O_RDWR | BDRV_O_RESIZE | BDRV_O_PROTOCOL, errp);
-    if (blk == NULL) {
-        ret = -EIO;
+    blk = blk_new(BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE | BLK_PERM_RESIZE,
+                  BLK_PERM_ALL);
+
+    ret = blk_insert_bs(blk, bs, errp);
+    if (ret < 0) {
         goto out_with_err_set;
     }
 
     blk_set_allow_write_beyond_eof(blk, true);
 
-    vdi_size = blk_getlength(blk);
-    if (vdi_size < 0) {
-        ret = vdi_size;
-        goto out;
-    }
-
-    base = blk_bs(blk)->opaque;
     object_size = (UINT32_C(1) << base->inode.block_size_shift);
     buf_size = MIN(object_size, SD_DATA_OBJ_SIZE);
     buf = g_malloc0(buf_size);
 
-    max_idx = DIV_ROUND_UP(vdi_size, buf_size);
+    max_idx = DIV_ROUND_UP(new_size, buf_size);
 
-    for (idx = 0; idx < max_idx; idx++) {
+    for (idx = old_size / buf_size; idx < max_idx; idx++) {
         /*
          * The created image can be a cloned image, so we need to read
          * a data from the source image.
@@ -1965,8 +1959,8 @@ static int parse_block_size_shift(BDRVSheepdogState *s, QemuOpts *opt)
     return 0;
 }
 
-static int sd_create(const char *filename, QemuOpts *opts,
-                     Error **errp)
+static int coroutine_fn sd_co_create_opts(const char *filename, QemuOpts *opts,
+                                          Error **errp)
 {
     Error *err = NULL;
     int ret = 0;
@@ -2108,7 +2102,20 @@ static int sd_create(const char *filename, QemuOpts *opts,
     }
 
     if (prealloc) {
-        ret = sd_prealloc(filename, errp);
+        BlockDriverState *bs;
+        QDict *opts;
+
+        opts = qdict_new();
+        qdict_put_str(opts, "driver", "sheepdog");
+        bs = bdrv_open(filename, NULL, opts, BDRV_O_PROTOCOL | BDRV_O_RDWR,
+                       errp);
+        if (!bs) {
+            goto out;
+        }
+
+        ret = sd_prealloc(bs, 0, s->inode.vdi_size, errp);
+
+        bdrv_unref(bs);
     }
 out:
     g_free(backing_file);
@@ -2173,15 +2180,16 @@ static int sd_truncate(BlockDriverState *bs, int64_t offset,
     int ret, fd;
     unsigned int datalen;
     uint64_t max_vdi_size;
+    int64_t old_size = s->inode.vdi_size;
 
-    if (prealloc != PREALLOC_MODE_OFF) {
+    if (prealloc != PREALLOC_MODE_OFF && prealloc != PREALLOC_MODE_FULL) {
         error_setg(errp, "Unsupported preallocation mode '%s'",
                    PreallocMode_str(prealloc));
         return -ENOTSUP;
     }
 
     max_vdi_size = (UINT64_C(1) << s->inode.block_size_shift) * MAX_DATA_OBJS;
-    if (offset < s->inode.vdi_size) {
+    if (offset < old_size) {
         error_setg(errp, "shrinking is not supported");
         return -EINVAL;
     } else if (offset > max_vdi_size) {
@@ -2204,9 +2212,17 @@ static int sd_truncate(BlockDriverState *bs, int64_t offset,
 
     if (ret < 0) {
         error_setg_errno(errp, -ret, "failed to update an inode");
+        return ret;
     }
 
-    return ret;
+    if (prealloc == PREALLOC_MODE_FULL) {
+        ret = sd_prealloc(bs, old_size, offset, errp);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+
+    return 0;
 }
 
 /*
@@ -2988,19 +3004,19 @@ static coroutine_fn int sd_co_pdiscard(BlockDriverState *bs, int64_t offset,
     return acb.ret;
 }
 
-static coroutine_fn int64_t
-sd_co_get_block_status(BlockDriverState *bs, int64_t sector_num, int nb_sectors,
-                       int *pnum, BlockDriverState **file)
+static coroutine_fn int
+sd_co_block_status(BlockDriverState *bs, bool want_zero, int64_t offset,
+                   int64_t bytes, int64_t *pnum, int64_t *map,
+                   BlockDriverState **file)
 {
     BDRVSheepdogState *s = bs->opaque;
     SheepdogInode *inode = &s->inode;
     uint32_t object_size = (UINT32_C(1) << inode->block_size_shift);
-    uint64_t offset = sector_num * BDRV_SECTOR_SIZE;
     unsigned long start = offset / object_size,
-                  end = DIV_ROUND_UP((sector_num + nb_sectors) *
-                                     BDRV_SECTOR_SIZE, object_size);
+                  end = DIV_ROUND_UP(offset + bytes, object_size);
     unsigned long idx;
-    int64_t ret = BDRV_BLOCK_DATA | BDRV_BLOCK_OFFSET_VALID | offset;
+    *map = offset;
+    int ret = BDRV_BLOCK_DATA | BDRV_BLOCK_OFFSET_VALID;
 
     for (idx = start; idx < end; idx++) {
         if (inode->data_vdi_id[idx] == 0) {
@@ -3017,9 +3033,9 @@ sd_co_get_block_status(BlockDriverState *bs, int64_t sector_num, int nb_sectors,
         }
     }
 
-    *pnum = (idx - start) * object_size / BDRV_SECTOR_SIZE;
-    if (*pnum > nb_sectors) {
-        *pnum = nb_sectors;
+    *pnum = (idx - start) * object_size;
+    if (*pnum > bytes) {
+        *pnum = bytes;
     }
     if (ret > 0 && ret & BDRV_BLOCK_OFFSET_VALID) {
         *file = bs;
@@ -3078,111 +3094,111 @@ static QemuOptsList sd_create_opts = {
 };
 
 static BlockDriver bdrv_sheepdog = {
-    .format_name    = "sheepdog",
-    .protocol_name  = "sheepdog",
-    .instance_size  = sizeof(BDRVSheepdogState),
-    .bdrv_parse_filename    = sd_parse_filename,
-    .bdrv_file_open = sd_open,
-    .bdrv_reopen_prepare    = sd_reopen_prepare,
-    .bdrv_reopen_commit     = sd_reopen_commit,
-    .bdrv_reopen_abort      = sd_reopen_abort,
-    .bdrv_close     = sd_close,
-    .bdrv_create    = sd_create,
-    .bdrv_has_zero_init = bdrv_has_zero_init_1,
-    .bdrv_getlength = sd_getlength,
+    .format_name                  = "sheepdog",
+    .protocol_name                = "sheepdog",
+    .instance_size                = sizeof(BDRVSheepdogState),
+    .bdrv_parse_filename          = sd_parse_filename,
+    .bdrv_file_open               = sd_open,
+    .bdrv_reopen_prepare          = sd_reopen_prepare,
+    .bdrv_reopen_commit           = sd_reopen_commit,
+    .bdrv_reopen_abort            = sd_reopen_abort,
+    .bdrv_close                   = sd_close,
+    .bdrv_co_create_opts          = sd_co_create_opts,
+    .bdrv_has_zero_init           = bdrv_has_zero_init_1,
+    .bdrv_getlength               = sd_getlength,
     .bdrv_get_allocated_file_size = sd_get_allocated_file_size,
-    .bdrv_truncate  = sd_truncate,
+    .bdrv_truncate                = sd_truncate,
 
-    .bdrv_co_readv  = sd_co_readv,
-    .bdrv_co_writev = sd_co_writev,
-    .bdrv_co_flush_to_disk  = sd_co_flush_to_disk,
-    .bdrv_co_pdiscard = sd_co_pdiscard,
-    .bdrv_co_get_block_status = sd_co_get_block_status,
+    .bdrv_co_readv                = sd_co_readv,
+    .bdrv_co_writev               = sd_co_writev,
+    .bdrv_co_flush_to_disk        = sd_co_flush_to_disk,
+    .bdrv_co_pdiscard             = sd_co_pdiscard,
+    .bdrv_co_block_status         = sd_co_block_status,
 
-    .bdrv_snapshot_create   = sd_snapshot_create,
-    .bdrv_snapshot_goto     = sd_snapshot_goto,
-    .bdrv_snapshot_delete   = sd_snapshot_delete,
-    .bdrv_snapshot_list     = sd_snapshot_list,
+    .bdrv_snapshot_create         = sd_snapshot_create,
+    .bdrv_snapshot_goto           = sd_snapshot_goto,
+    .bdrv_snapshot_delete         = sd_snapshot_delete,
+    .bdrv_snapshot_list           = sd_snapshot_list,
 
-    .bdrv_save_vmstate  = sd_save_vmstate,
-    .bdrv_load_vmstate  = sd_load_vmstate,
+    .bdrv_save_vmstate            = sd_save_vmstate,
+    .bdrv_load_vmstate            = sd_load_vmstate,
 
-    .bdrv_detach_aio_context = sd_detach_aio_context,
-    .bdrv_attach_aio_context = sd_attach_aio_context,
+    .bdrv_detach_aio_context      = sd_detach_aio_context,
+    .bdrv_attach_aio_context      = sd_attach_aio_context,
 
-    .create_opts    = &sd_create_opts,
+    .create_opts                  = &sd_create_opts,
 };
 
 static BlockDriver bdrv_sheepdog_tcp = {
-    .format_name    = "sheepdog",
-    .protocol_name  = "sheepdog+tcp",
-    .instance_size  = sizeof(BDRVSheepdogState),
-    .bdrv_parse_filename    = sd_parse_filename,
-    .bdrv_file_open = sd_open,
-    .bdrv_reopen_prepare    = sd_reopen_prepare,
-    .bdrv_reopen_commit     = sd_reopen_commit,
-    .bdrv_reopen_abort      = sd_reopen_abort,
-    .bdrv_close     = sd_close,
-    .bdrv_create    = sd_create,
-    .bdrv_has_zero_init = bdrv_has_zero_init_1,
-    .bdrv_getlength = sd_getlength,
+    .format_name                  = "sheepdog",
+    .protocol_name                = "sheepdog+tcp",
+    .instance_size                = sizeof(BDRVSheepdogState),
+    .bdrv_parse_filename          = sd_parse_filename,
+    .bdrv_file_open               = sd_open,
+    .bdrv_reopen_prepare          = sd_reopen_prepare,
+    .bdrv_reopen_commit           = sd_reopen_commit,
+    .bdrv_reopen_abort            = sd_reopen_abort,
+    .bdrv_close                   = sd_close,
+    .bdrv_co_create_opts          = sd_co_create_opts,
+    .bdrv_has_zero_init           = bdrv_has_zero_init_1,
+    .bdrv_getlength               = sd_getlength,
     .bdrv_get_allocated_file_size = sd_get_allocated_file_size,
-    .bdrv_truncate  = sd_truncate,
+    .bdrv_truncate                = sd_truncate,
 
-    .bdrv_co_readv  = sd_co_readv,
-    .bdrv_co_writev = sd_co_writev,
-    .bdrv_co_flush_to_disk  = sd_co_flush_to_disk,
-    .bdrv_co_pdiscard = sd_co_pdiscard,
-    .bdrv_co_get_block_status = sd_co_get_block_status,
+    .bdrv_co_readv                = sd_co_readv,
+    .bdrv_co_writev               = sd_co_writev,
+    .bdrv_co_flush_to_disk        = sd_co_flush_to_disk,
+    .bdrv_co_pdiscard             = sd_co_pdiscard,
+    .bdrv_co_block_status         = sd_co_block_status,
 
-    .bdrv_snapshot_create   = sd_snapshot_create,
-    .bdrv_snapshot_goto     = sd_snapshot_goto,
-    .bdrv_snapshot_delete   = sd_snapshot_delete,
-    .bdrv_snapshot_list     = sd_snapshot_list,
+    .bdrv_snapshot_create         = sd_snapshot_create,
+    .bdrv_snapshot_goto           = sd_snapshot_goto,
+    .bdrv_snapshot_delete         = sd_snapshot_delete,
+    .bdrv_snapshot_list           = sd_snapshot_list,
 
-    .bdrv_save_vmstate  = sd_save_vmstate,
-    .bdrv_load_vmstate  = sd_load_vmstate,
+    .bdrv_save_vmstate            = sd_save_vmstate,
+    .bdrv_load_vmstate            = sd_load_vmstate,
 
-    .bdrv_detach_aio_context = sd_detach_aio_context,
-    .bdrv_attach_aio_context = sd_attach_aio_context,
+    .bdrv_detach_aio_context      = sd_detach_aio_context,
+    .bdrv_attach_aio_context      = sd_attach_aio_context,
 
-    .create_opts    = &sd_create_opts,
+    .create_opts                  = &sd_create_opts,
 };
 
 static BlockDriver bdrv_sheepdog_unix = {
-    .format_name    = "sheepdog",
-    .protocol_name  = "sheepdog+unix",
-    .instance_size  = sizeof(BDRVSheepdogState),
-    .bdrv_parse_filename    = sd_parse_filename,
-    .bdrv_file_open = sd_open,
-    .bdrv_reopen_prepare    = sd_reopen_prepare,
-    .bdrv_reopen_commit     = sd_reopen_commit,
-    .bdrv_reopen_abort      = sd_reopen_abort,
-    .bdrv_close     = sd_close,
-    .bdrv_create    = sd_create,
-    .bdrv_has_zero_init = bdrv_has_zero_init_1,
-    .bdrv_getlength = sd_getlength,
+    .format_name                  = "sheepdog",
+    .protocol_name                = "sheepdog+unix",
+    .instance_size                = sizeof(BDRVSheepdogState),
+    .bdrv_parse_filename          = sd_parse_filename,
+    .bdrv_file_open               = sd_open,
+    .bdrv_reopen_prepare          = sd_reopen_prepare,
+    .bdrv_reopen_commit           = sd_reopen_commit,
+    .bdrv_reopen_abort            = sd_reopen_abort,
+    .bdrv_close                   = sd_close,
+    .bdrv_co_create_opts          = sd_co_create_opts,
+    .bdrv_has_zero_init           = bdrv_has_zero_init_1,
+    .bdrv_getlength               = sd_getlength,
     .bdrv_get_allocated_file_size = sd_get_allocated_file_size,
-    .bdrv_truncate  = sd_truncate,
+    .bdrv_truncate                = sd_truncate,
 
-    .bdrv_co_readv  = sd_co_readv,
-    .bdrv_co_writev = sd_co_writev,
-    .bdrv_co_flush_to_disk  = sd_co_flush_to_disk,
-    .bdrv_co_pdiscard = sd_co_pdiscard,
-    .bdrv_co_get_block_status = sd_co_get_block_status,
+    .bdrv_co_readv                = sd_co_readv,
+    .bdrv_co_writev               = sd_co_writev,
+    .bdrv_co_flush_to_disk        = sd_co_flush_to_disk,
+    .bdrv_co_pdiscard             = sd_co_pdiscard,
+    .bdrv_co_block_status         = sd_co_block_status,
 
-    .bdrv_snapshot_create   = sd_snapshot_create,
-    .bdrv_snapshot_goto     = sd_snapshot_goto,
-    .bdrv_snapshot_delete   = sd_snapshot_delete,
-    .bdrv_snapshot_list     = sd_snapshot_list,
+    .bdrv_snapshot_create         = sd_snapshot_create,
+    .bdrv_snapshot_goto           = sd_snapshot_goto,
+    .bdrv_snapshot_delete         = sd_snapshot_delete,
+    .bdrv_snapshot_list           = sd_snapshot_list,
 
-    .bdrv_save_vmstate  = sd_save_vmstate,
-    .bdrv_load_vmstate  = sd_load_vmstate,
+    .bdrv_save_vmstate            = sd_save_vmstate,
+    .bdrv_load_vmstate            = sd_load_vmstate,
 
-    .bdrv_detach_aio_context = sd_detach_aio_context,
-    .bdrv_attach_aio_context = sd_attach_aio_context,
+    .bdrv_detach_aio_context      = sd_detach_aio_context,
+    .bdrv_attach_aio_context      = sd_attach_aio_context,
 
-    .create_opts    = &sd_create_opts,
+    .create_opts                  = &sd_create_opts,
 };
 
 static void bdrv_sheepdog_init(void)

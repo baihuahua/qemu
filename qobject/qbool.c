@@ -13,7 +13,6 @@
 
 #include "qemu/osdep.h"
 #include "qapi/qmp/qbool.h"
-#include "qapi/qmp/qobject.h"
 #include "qemu-common.h"
 
 /**
@@ -49,6 +48,14 @@ QBool *qobject_to_qbool(const QObject *obj)
         return NULL;
     }
     return container_of(obj, QBool, base);
+}
+
+/**
+ * qbool_is_equal(): Test whether the two QBools are equal
+ */
+bool qbool_is_equal(const QObject *x, const QObject *y)
+{
+    return qobject_to_qbool(x)->value == qobject_to_qbool(y)->value;
 }
 
 /**

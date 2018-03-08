@@ -1,8 +1,10 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/qmp/qdict.h"
+#include "qapi/qmp/qerror.h"
 #include "qom/object_interfaces.h"
 #include "qemu/module.h"
-#include "qapi-visit.h"
+#include "qemu/option.h"
 #include "qapi/opts-visitor.h"
 #include "qemu/config-file.h"
 
@@ -191,6 +193,11 @@ void user_creatable_del(const char *id, Error **errp)
                                  id));
 
     object_unparent(obj);
+}
+
+void user_creatable_cleanup(void)
+{
+    object_unparent(object_get_objects_root());
 }
 
 static void register_types(void)

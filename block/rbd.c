@@ -16,11 +16,14 @@
 #include <rbd/librbd.h>
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/option.h"
 #include "block/block_int.h"
 #include "crypto/secret.h"
 #include "qemu/cutils.h"
 #include "qapi/qmp/qstring.h"
+#include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qjson.h"
+#include "qapi/qmp/qlist.h"
 
 /*
  * When specifying the image filename use:
@@ -348,7 +351,9 @@ static QemuOptsList runtime_opts = {
     },
 };
 
-static int qemu_rbd_create(const char *filename, QemuOpts *opts, Error **errp)
+static int coroutine_fn qemu_rbd_co_create_opts(const char *filename,
+                                                QemuOpts *opts,
+                                                Error **errp)
 {
     Error *local_err = NULL;
     int64_t bytes = 0;
@@ -665,10 +670,16 @@ static int qemu_rbd_open(BlockDriverState *bs, QDict *options, int flags,
     /* If we are using an rbd snapshot, we must be r/o, otherwise
      * leave as-is */
     if (s->snap != NULL) {
-        r = bdrv_set_read_only(bs, true, &local_err);
-        if (r < 0) {
-            error_propagate(errp, local_err);
-            goto failed_open;
+        if (!bdrv_is_read_only(bs)) {
+            error_report("Opening rbd snapshots without an explicit "
+                         "read-only=on option is deprecated. Future versions "
+                         "will refuse to open the image instead of "
+                         "automatically marking the image read-only.");
+            r = bdrv_set_read_only(bs, true, &local_err);
+            if (r < 0) {
+                error_propagate(errp, local_err);
+                goto failed_open;
+            }
         }
     }
 
@@ -1123,7 +1134,7 @@ static BlockDriver bdrv_rbd = {
     .bdrv_file_open         = qemu_rbd_open,
     .bdrv_close             = qemu_rbd_close,
     .bdrv_reopen_prepare    = qemu_rbd_reopen_prepare,
-    .bdrv_create            = qemu_rbd_create,
+    .bdrv_co_create_opts    = qemu_rbd_co_create_opts,
     .bdrv_has_zero_init     = bdrv_has_zero_init_1,
     .bdrv_get_info          = qemu_rbd_getinfo,
     .create_opts            = &qemu_rbd_create_opts,

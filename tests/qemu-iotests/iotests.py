@@ -28,6 +28,7 @@ import qtest
 import struct
 import json
 import signal
+import logging
 
 
 # This will not work if arguments contain spaces but is necessary if we
@@ -57,6 +58,11 @@ qemu_default_machine = os.environ.get('QEMU_DEFAULT_MACHINE')
 socket_scm_helper = os.environ.get('SOCKET_SCM_HELPER', 'socket_scm_helper')
 debug = False
 
+luks_default_secret_object = 'secret,id=keysec0,data=' + \
+                             os.environ['IMGKEYSECRET']
+luks_default_key_secret_opt = 'key-secret=keysec0'
+
+
 def qemu_img(*args):
     '''Run qemu-img and return the exit code'''
     devnull = open('/dev/null', 'r+')
@@ -64,6 +70,25 @@ def qemu_img(*args):
     if exitcode < 0:
         sys.stderr.write('qemu-img received signal %i: %s\n' % (-exitcode, ' '.join(qemu_img_args + list(args))))
     return exitcode
+
+def qemu_img_create(*args):
+    args = list(args)
+
+    # default luks support
+    if '-f' in args and args[args.index('-f') + 1] == 'luks':
+        if '-o' in args:
+            i = args.index('-o')
+            if 'key-secret' not in args[i + 1]:
+                args[i + 1].append(luks_default_key_secret_opt)
+                args.insert(i + 2, '--object')
+                args.insert(i + 3, luks_default_secret_object)
+        else:
+            args = ['-o', luks_default_key_secret_opt,
+                    '--object', luks_default_secret_object] + args
+
+    args.insert(0, 'create')
+
+    return qemu_img(*args)
 
 def qemu_img_verbose(*args):
     '''Run qemu-img without suppressing its output and return the exit code'''
@@ -91,6 +116,44 @@ def qemu_io(*args):
     if exitcode < 0:
         sys.stderr.write('qemu-io received signal %i: %s\n' % (-exitcode, ' '.join(args)))
     return subp.communicate()[0]
+
+
+class QemuIoInteractive:
+    def __init__(self, *args):
+        self.args = qemu_io_args + list(args)
+        self._p = subprocess.Popen(self.args, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT)
+        assert self._p.stdout.read(9) == 'qemu-io> '
+
+    def close(self):
+        self._p.communicate('q\n')
+
+    def _read_output(self):
+        pattern = 'qemu-io> '
+        n = len(pattern)
+        pos = 0
+        s = []
+        while pos != n:
+            c = self._p.stdout.read(1)
+            # check unexpected EOF
+            assert c != ''
+            s.append(c)
+            if c == pattern[pos]:
+                pos += 1
+            else:
+                pos = 0
+
+        return ''.join(s[:-n])
+
+    def cmd(self, cmd):
+        # quit command is in close(), '\n' is added automatically
+        assert '\n' not in cmd
+        cmd = cmd.strip()
+        assert cmd != 'q' and cmd != 'quit'
+        self._p.stdin.write(cmd + '\n')
+        return self._read_output()
+
 
 def qemu_nbd(*args):
     '''Run qemu-nbd in daemon mode and return the parent's exit code'''
@@ -160,6 +223,32 @@ class Timeout:
     def timeout(self, signum, frame):
         raise Exception(self.errmsg)
 
+
+class FilePath(object):
+    '''An auto-generated filename that cleans itself up.
+
+    Use this context manager to generate filenames and ensure that the file
+    gets deleted::
+
+        with TestFilePath('test.img') as img_path:
+            qemu_img('create', img_path, '1G')
+        # migration_sock_path is automatically deleted
+    '''
+    def __init__(self, name):
+        filename = '{0}-{1}'.format(os.getpid(), name)
+        self.path = os.path.join(test_dir, filename)
+
+    def __enter__(self):
+        return self.path
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+        return False
+
+
 class VM(qtest.QEMUQtestMachine):
     '''A QEMU VM'''
 
@@ -168,9 +257,12 @@ class VM(qtest.QEMUQtestMachine):
         super(VM, self).__init__(qemu_prog, qemu_opts, name=name,
                                  test_dir=test_dir,
                                  socket_scm_helper=socket_scm_helper)
-        if debug:
-            self._debug = True
         self._num_drives = 0
+
+    def add_object(self, opts):
+        self._args.append('-object')
+        self._args.append(opts)
+        return self
 
     def add_device(self, opts):
         self._args.append('-device')
@@ -194,6 +286,13 @@ class VM(qtest.QEMUQtestMachine):
 
         if opts:
             options.append(opts)
+
+        if format == 'luks' and 'key-secret' not in opts:
+            # default luks support
+            if luks_default_secret_object not in self._args:
+                self.add_object(luks_default_secret_object)
+
+            options.append(luks_default_key_secret_opt)
 
         self._args.append('-drive')
         self._args.append(','.join(options))
@@ -395,8 +494,10 @@ def notrun(reason):
     print '%s not run: %s' % (seq, reason)
     sys.exit(0)
 
-def verify_image_format(supported_fmts=[]):
+def verify_image_format(supported_fmts=[], unsupported_fmts=[]):
     if supported_fmts and (imgfmt not in supported_fmts):
+        notrun('not suitable for this image format: %s' % imgfmt)
+    if unsupported_fmts and (imgfmt in unsupported_fmts):
         notrun('not suitable for this image format: %s' % imgfmt)
 
 def verify_platform(supported_oses=['linux']):
@@ -438,6 +539,8 @@ def main(supported_fmts=[], supported_oses=['linux']):
         sys.argv.remove('-d')
     else:
         output = StringIO.StringIO()
+
+    logging.basicConfig(level=(logging.DEBUG if debug else logging.WARN))
 
     class MyTestRunner(unittest.TextTestRunner):
         def __init__(self, stream=output, descriptions=True, verbosity=verbosity):

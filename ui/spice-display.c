@@ -16,9 +16,9 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu-common.h"
 #include "ui/qemu-spice.h"
 #include "qemu/timer.h"
+#include "qemu/option.h"
 #include "qemu/queue.h"
 #include "ui/console.h"
 #include "sysemu/sysemu.h"
@@ -519,7 +519,6 @@ static void interface_attach_worker(QXLInstance *sin, QXLWorker *qxl_worker)
     SimpleSpiceDisplay *ssd = container_of(sin, SimpleSpiceDisplay, qxl);
 
     dprint(1, "%s/%d:\n", __func__, ssd->qxl.id);
-    ssd->worker = qxl_worker;
 }
 
 static void interface_set_compression_level(QXLInstance *sin, int level)
@@ -630,13 +629,13 @@ static int interface_req_cursor_notification(QXLInstance *sin)
 
 static void interface_notify_update(QXLInstance *sin, uint32_t update_id)
 {
-    fprintf(stderr, "%s: abort()\n", __FUNCTION__);
+    fprintf(stderr, "%s: abort()\n", __func__);
     abort();
 }
 
 static int interface_flush_resources(QXLInstance *sin)
 {
-    fprintf(stderr, "%s: abort()\n", __FUNCTION__);
+    fprintf(stderr, "%s: abort()\n", __func__);
     abort();
     return 0;
 }
@@ -850,7 +849,7 @@ static void qemu_spice_gl_unblock_bh(void *opaque)
 
 static void qemu_spice_gl_block_timer(void *opaque)
 {
-    fprintf(stderr, "WARNING: spice: no gl-draw-done within one second\n");
+    warn_report("spice: no gl-draw-done within one second");
 }
 
 static void spice_gl_refresh(DisplayChangeListener *dcl)
@@ -1019,7 +1018,7 @@ static void qemu_spice_display_init_one(QemuConsole *con)
         ssd->gl_unblock_bh = qemu_bh_new(qemu_spice_gl_unblock_bh, ssd);
         ssd->gl_unblock_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
                                              qemu_spice_gl_block_timer, ssd);
-        ssd->gls = console_gl_init_context();
+        ssd->gls = qemu_gl_init_shader();
         ssd->have_surface = false;
         ssd->have_scanout = false;
     }
@@ -1028,7 +1027,6 @@ static void qemu_spice_display_init_one(QemuConsole *con)
 
     ssd->qxl.base.sif = &dpy_interface.base;
     qemu_spice_add_display_interface(&ssd->qxl, con);
-    assert(ssd->worker);
     qemu_spice_create_host_memslot(ssd);
 
     register_displaychangelistener(&ssd->dcl);
