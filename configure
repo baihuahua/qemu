@@ -3491,7 +3491,7 @@ if test "$tcmu" != "no"; then
   if ! $pkg_config gio-unix-2.0; then
     error_exit "glib is required to compile QEMU"
   fi
-    tcmu_libs="-lnl-3 -lnl-genl-3"
+    tcmu_libs="-lnl-3 -lnl-genl-3 -lglib-2.0 -lgobject-2.0 -lgmodule-2.0 -lgio-2.0"
     tcmu_cflags="-Wno-error"
 fi
 

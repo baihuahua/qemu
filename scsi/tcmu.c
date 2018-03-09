@@ -549,6 +549,9 @@ void qemu_tcmu_start(const char *subtype, Error **errp)
     }
     fd = tcmulib_get_master_fd(handler_state->tcmulib_ctx);
     qemu_set_fd_handler(fd, qemu_tcmu_master_read, NULL, handler_state);
+
+    tcmulib_register(handler_state->tcmulib_ctx);
+
     return;
 fail:
     g_free(handler_state);

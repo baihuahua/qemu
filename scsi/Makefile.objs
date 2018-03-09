@@ -4,6 +4,6 @@ block-obj-$(CONFIG_LINUX) += pr-manager.o pr-manager-helper.o
 
 block-obj-$(CONFIG_TCMU) += tcmu.mo
 
-tcmu.mo-objs       := tcmu.o alua.o api.o configfs.o libtcmu.o target.o
+tcmu.mo-objs       := tcmu.o alua.o api.o configfs.o libtcmu.o target.o libtcmu-register.o tcmuhandler-generated.o
 tcmu.mo-cflags     := $(TCMU_CFLAGS)
 tcmu.mo-libs       := $(TCMU_LIBS)
