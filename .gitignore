@@ -100,6 +100,7 @@
 /qapi/qapi-visit-ui.[ch]
 /qapi/qapi-visit.[ch]
 /qapi/qapi-doc.texi
+/scsi/tcmuhandler-generated.[ch]
 /qemu-doc.html
 /qemu-doc.info
 /qemu-doc.txt

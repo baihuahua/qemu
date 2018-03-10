@@ -176,6 +176,10 @@ endif
 
 GENERATED_FILES += module_block.h
 
+ifdef CONFIG_TCMU
+GENERATED_FILES += scsi/tcmuhandler-generated.c scsi/tcmuhandler-generated.h
+endif
+
 TRACE_HEADERS = trace-root.h $(trace-events-subdirs:%=%/trace.h)
 TRACE_SOURCES = trace-root.c $(trace-events-subdirs:%=%/trace.c)
 TRACE_DTRACE =
