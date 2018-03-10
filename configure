@@ -3492,7 +3492,7 @@ if test "$tcmu" != "no"; then
     error_exit "glib is required to compile QEMU"
   fi
     tcmu_libs="-lnl-3 -lnl-genl-3 -lglib-2.0 -lgobject-2.0 -lgmodule-2.0 -lgio-2.0"
-    tcmu_cflags="-Wno-error"
+    tcmu_cflags="-Wno-error -I /usr/include/libnl3/"
 fi
 
 
